@@ -10,6 +10,11 @@ Notes and assumptions:
 - The trigger enforces that for each prereq of a class the student must have at least one prior passing grade meeting the required minimum (A/B/C/D). Grades I or W or NULL are not considered passing. If a prereq is missing, the trigger raises SQLSTATE '75000' with message 'Missing Pre-req'.
 - The DDL uses PRIMARY KEYs on student and class to prevent duplicates.
 - Foreign keys on class_prereq and schedule have ON DELETE CASCADE to cascade deletes per assignment requirement.
-- The create script issues CREATE DB CS257. If the DB already exists, that statement will fail; in that case manually connect to CS257 and run the remainder of the script or remove that line.
+- This does not create the CS257 database. It only performs the DDL/trigger actions (creates tables, constraints, and the classcheck trigger). Create and connect to the database yourself before running the scripts.
 
-If you'd like, I can update the scripts to avoid creating the DB (useful if you already have CS257) or add more test cases.
+Steps to follow:
+ - Create database (only once): db2 "create db CS257"
+ - Connect to database: db2 "connect to CS257"
+ - Run create script: db2 -td"^" -f create.sql
+ - Run test script: db2 -td"^" -f hw3.sql
+ - Clean up (drop HW3 objects): db2 -td"^" -f drop.sql

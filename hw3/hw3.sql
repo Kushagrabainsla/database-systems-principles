@@ -69,7 +69,21 @@ INSERT INTO hw3.schedule VALUES ('900001','200004',3,2022,NULL)^
 INSERT INTO hw3.schedule VALUES ('900001','200001',1,2021,'C')^
 INSERT INTO hw3.schedule VALUES ('900001','200004',3,2022,NULL)^
 
--- 5) Multi-prereq (CS160 = 200003) for James (900002)
+-- 5) In-progress prereq: Chris (900003) is currently taking 200001 (NULL) then tries 200004 -> should fail
+INSERT INTO hw3.schedule VALUES ('900003','200001',2,2022,NULL)^
+INSERT INTO hw3.schedule VALUES ('900003','200004',3,2022,NULL)^
+
+-- 6) Repeat class scenario: Ken (900004) failed 100000 then later passed it; afterwards register for 100001 -> should succeed
+INSERT INTO hw3.schedule VALUES ('900004','100000',1,2019,'F')^
+INSERT INTO hw3.schedule VALUES ('900004','100000',2,2020,'A')^
+INSERT INTO hw3.schedule VALUES ('900004','100001',3,2022,NULL)^
+
+-- 7) Partial prereqs: John (900000) has only two of three prereqs for CS160 -> should fail
+INSERT INTO hw3.schedule VALUES ('900000','010000',1,2019,'C')^
+INSERT INTO hw3.schedule VALUES ('900000','200000',2,2019,'C')^
+INSERT INTO hw3.schedule VALUES ('900000','200003',3,2022,NULL)^
+
+-- 8) Multi-prereq (CS160 = 200003) for James (900002)
 --    First try without prereqs -> should fail
 INSERT INTO hw3.schedule VALUES ('900002','200003',3,2022,NULL)^
 --    Now give all three prereqs (010000,200000,200006) with passing grades then try again -> should succeed
@@ -78,19 +92,6 @@ INSERT INTO hw3.schedule VALUES ('900002','200000',2,2020,'B')^
 INSERT INTO hw3.schedule VALUES ('900002','200006',3,2020,'C')^
 INSERT INTO hw3.schedule VALUES ('900002','200003',3,2022,NULL)^
 
--- 6) In-progress prereq: Chris (900003) is currently taking 200001 (NULL) then tries 200004 -> should fail
-INSERT INTO hw3.schedule VALUES ('900003','200001',2,2022,NULL)^
-INSERT INTO hw3.schedule VALUES ('900003','200004',3,2022,NULL)^
-
--- 7) Repeat class scenario: Ken (900004) failed 100000 then later passed it; afterwards register for 100001 -> should succeed
-INSERT INTO hw3.schedule VALUES ('900004','100000',1,2019,'F')^
-INSERT INTO hw3.schedule VALUES ('900004','100000',2,2020,'A')^
-INSERT INTO hw3.schedule VALUES ('900004','100001',3,2022,NULL)^
-
--- 8) Partial prereqs: John (900000) has only two of three prereqs for CS160 -> should fail
-INSERT INTO hw3.schedule VALUES ('900000','010000',1,2019,'C')^
-INSERT INTO hw3.schedule VALUES ('900000','200000',2,2019,'C')^
-INSERT INTO hw3.schedule VALUES ('900000','200003',3,2022,NULL)^
 
 -- Show contents to inspect results
 select * from hw3.student order by student_id^
