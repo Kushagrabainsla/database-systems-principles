@@ -1,0 +1,149 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+EXEC SQL INCLUDE SQLCA;
+
+/* format helper */
+static void print_num11_2(double v, short ind) {
+  if (ind < 0) printf("%11s", "-");
+  else         printf("%11.2f", v);
+}
+
+int main(int argc, char *argv[]) {
+  EXEC SQL BEGIN DECLARE SECTION;
+    char dbname[64];
+
+    /* Department */
+    char d_deptno[4];
+    char d_deptname[37];
+    char d_mgrno[7];
+    char d_admrdept[4];
+    char d_location[17];
+    short d_ind_mgrno, d_ind_location;
+
+    /* Employee */
+    char e_firstname[13];
+    char e_lastname[16];
+    char e_midinit[2];
+    char e_sex[2];
+    double e_bonus, e_comm, e_salary;
+    short e_ind_mid, e_ind_sex, e_ind_bonus, e_ind_comm, e_ind_salary;
+
+    /* Employee join Department */
+    char ejd_firstname[13];
+    char ejd_lastname[16];
+    char ejd_deptno[4];
+    char ejd_deptname[37];
+    char ejd_mgrno[7];
+    short ejd_ind_mgrno;
+  EXEC SQL END DECLARE SECTION;
+
+  /* choose db passd through arguments */
+  memset(dbname, 0, sizeof(dbname));
+  if (argc > 1) strncpy(dbname, argv[1], sizeof(dbname)-1);
+  else strncpy(dbname, "sample", sizeof(dbname)-1);
+
+  EXEC SQL CONNECT TO :dbname;
+  if (sqlca.sqlcode != 0) {
+    fprintf(stderr, "CONNECT failed, SQLCODE=%ld\n", (long)sqlca.sqlcode);
+    return 1;
+  }
+
+  /* --------- Part 1: Department --------- */
+  {
+    int rows=0;
+    EXEC SQL DECLARE dept_cur CURSOR FOR
+      SELECT deptno,
+             CHAR(deptname,36),
+             mgrno,
+             admrdept,
+             CHAR(location,16)
+        FROM department
+        ORDER BY deptno;
+
+    printf("\nPART 1: Department\n\n");
+    printf("%-6s %-36s %-6s %-8s %-16s\n","DEPTNO","DEPTNAME","MGRNO","ADMRDEPT","LOCATION");
+    printf("------ ------------------------------------ ------ -------- ----------------\n");
+
+    EXEC SQL OPEN dept_cur;
+    while (1) {
+      EXEC SQL FETCH dept_cur
+        INTO :d_deptno, :d_deptname, :d_mgrno :d_ind_mgrno,
+             :d_admrdept, :d_location :d_ind_location;
+      if (sqlca.sqlcode == 100) break;
+      printf("%-6s %-36s %-6s %-8s %-16s\n", d_deptno, d_deptname, (d_ind_mgrno<0?"-":d_mgrno), d_admrdept, (d_ind_location<0?"-":d_location));
+      rows++;
+    }
+    EXEC SQL CLOSE dept_cur;
+    printf("\n%4d record(s) selected.\n\n", rows);
+  }
+
+  /* --------- Part 2: Employee --------- */
+  {
+    int rows=0;
+    EXEC SQL DECLARE emp_cur CURSOR FOR
+      SELECT CHAR(firstnme,12),
+             CHAR(lastname,15),
+             midinit,
+             sex,
+             bonus,
+             comm,
+             salary
+        FROM employee
+        ORDER BY lastname, firstnme;
+
+    printf("PART 2: Employee (selected columns)\n\n");
+    printf("%-12s %-15s %-7s %-3s %-11s %-11s %-11s\n","FIRSTNME","LASTNAME","MIDINIT","SEX","BONUS","COMM","SALARY");
+    printf("------------ --------------- ------- --- ----------- ----------- -----------\n");
+
+    EXEC SQL OPEN emp_cur;
+    while (1) {
+      EXEC SQL FETCH emp_cur
+        INTO :e_firstname, :e_lastname, :e_midinit :e_ind_mid,
+             :e_sex :e_ind_sex, :e_bonus :e_ind_bonus,
+             :e_comm :e_ind_comm, :e_salary :e_ind_salary;
+      if (sqlca.sqlcode == 100) break;
+      printf("%-12s %-15s %-7s %-3s ", e_firstname, e_lastname, (e_ind_mid<0?"-":e_midinit), (e_ind_sex<0?"-":e_sex));
+      print_num11_2(e_bonus, e_ind_bonus); putchar(' ');
+      print_num11_2(e_comm, e_ind_comm);  putchar(' ');
+      print_num11_2(e_salary, e_ind_salary); putchar('\n');
+      rows++;
+    }
+    EXEC SQL CLOSE emp_cur;
+    printf("\n%4d record(s) selected.\n\n", rows);
+  }
+
+  /* --------- Part 3: Join --------- */
+  {
+    int rows=0;
+    EXEC SQL DECLARE j_cur CURSOR FOR
+      SELECT CHAR(e.firstnme,12),
+             CHAR(e.lastname,15),
+             d.deptno,
+             CHAR(d.deptname,36),
+             d.mgrno
+        FROM employee e
+        JOIN department d ON e.workdept=d.deptno
+        ORDER BY e.lastname, e.firstnme;
+
+    printf("PART 3: Employee x Department (Join)\n\n");
+    printf("%-12s %-15s %-6s %-36s %-6s\n","FIRSTNME","LASTNAME","DEPTNO","DEPTNAME","MGRNO");
+    printf("------------ --------------- ------ ------------------------------------ ------\n");
+
+    EXEC SQL OPEN j_cur;
+    while (1) {
+      EXEC SQL FETCH j_cur
+        INTO :ejd_firstname, :ejd_lastname, :ejd_deptno, :ejd_deptname, :ejd_mgrno :ejd_ind_mgrno;
+      if (sqlca.sqlcode == 100) break;
+      printf("%-12s %-15s %-6s %-36s %-6s\n", ejd_firstname, ejd_lastname, ejd_deptno, ejd_deptname, (ejd_ind_mgrno<0?"-":ejd_mgrno));
+      rows++;
+    }
+    EXEC SQL CLOSE j_cur;
+    printf("\n%4d record(s) selected.\n\n", rows);
+  }
+
+  EXEC SQL COMMIT;
+  EXEC SQL CONNECT RESET;
+  return 0;
+}

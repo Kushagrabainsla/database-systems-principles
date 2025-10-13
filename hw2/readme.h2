@@ -1,0 +1,16 @@
+CS257 HW #2 - h2.sqc Instructions
+
+1. Connect to SAMPLE:
+   db2 connect to sample
+
+2. Preprocess embedded SQL:
+   db2 prep h2.sqc
+
+3. Compile:
+   gcc -I../sqllib/include -c h2.c
+
+4. Link:
+   gcc -o h2 h2.o -L../sqllib/lib -ldb2
+
+5. Run:
+   ./h2 sample
