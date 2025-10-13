@@ -52,6 +52,11 @@ NO CASCADE BEFORE INSERT ON hw3.schedule
 REFERENCING NEW AS N
 FOR EACH ROW MODE DB2SQL
 BEGIN ATOMIC
+    -- Only enforce prereqs when a student is registering (grade is NULL).
+    -- Allow inserting historical/completed grades (grade IS NOT NULL) for data seeding.
+    IF N.GRADE IS NOT NULL THEN
+       RETURN;
+    END IF;
     -- Count pre-reqs for N.CLASS_ID that the student has NOT satisfied yet
     DECLARE V_MISSING INT DEFAULT 0;
 
