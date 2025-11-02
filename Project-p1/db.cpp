@@ -9,10 +9,98 @@
 #include <ctype.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <stdint.h>
+#include <errno.h>
 
 #if defined(_WIN32) || defined(_WIN64)
 #define strcasecmp _stricmp
 #endif
+
+#define MAX_ROWS 100
+
+typedef struct table_file_header_def {
+  int32_t file_size;
+  int32_t record_size;
+  int32_t num_records;
+  int32_t record_offset;
+  int32_t file_header_flag;
+  int64_t tpd_ptr; // MUST be 0 on disk
+} table_file_header;
+
+static int open_tab_rw(const char *table_name, FILE **pf, table_file_header *hdr)
+{
+  char fname[MAX_IDENT_LEN + 5] = {0};
+  snprintf(fname, sizeof(fname), "%s.tab", table_name);
+
+  *pf = fopen(fname, "rb+");         // read/write binary
+  if (!*pf) return FILE_OPEN_ERROR;
+
+  fseek(*pf, 0, SEEK_SET);
+  if (fread(hdr, sizeof(*hdr), 1, *pf) != 1) { fclose(*pf); *pf = NULL; return FILE_OPEN_ERROR; }
+  return 0;
+}
+
+static int write_header(FILE *f, const table_file_header *hdr_in)
+{
+  table_file_header on_disk = *hdr_in;
+  on_disk.tpd_ptr = 0; // zero when writing
+  fseek(f, 0, SEEK_SET);
+  if (fwrite(&on_disk, sizeof(on_disk), 1, f) != 1) return FILE_WRITE_ERROR;
+  fflush(f);
+  return 0;
+}
+
+static long row_pos(const table_file_header *hdr, int row_idx)
+{
+  return (long)hdr->record_offset + (long)row_idx * (long)hdr->record_size;
+}
+
+static inline int round4(int n) { return (n + 3) & ~3; }
+
+static int compute_record_size_from_tpd(const tpd_entry *tpd) {
+  int rec = 0;
+  const cd_entry *col = (const cd_entry*)((const char*)tpd + tpd->cd_offset);
+  for (int i = 0; i < tpd->num_columns; ++i, ++col) {
+    if (col->col_type == T_INT) rec += 1 + 4;          // 1-byte length + 4
+    else                        rec += 1 + col->col_len; // CHAR/VARCHAR(n)
+  }
+  return round4(rec);
+}
+
+static int create_table_data_file(const tpd_entry *tpd) {
+  char fname[MAX_IDENT_LEN + 5] = {0};
+  snprintf(fname, sizeof(fname), "%s.tab", tpd->table_name);
+
+  int rec_size = compute_record_size_from_tpd(tpd);
+
+  table_file_header hdr = {0};
+  hdr.record_size    = rec_size;
+  hdr.num_records    = 0;
+  hdr.record_offset  = sizeof(table_file_header);
+  hdr.file_size      = hdr.record_offset + rec_size * MAX_ROWS;
+  hdr.file_header_flag = 0;
+  hdr.tpd_ptr        = 0; // zero on disk
+
+  char *zeros = (char*)calloc(1, hdr.file_size);
+  if (!zeros) return MEMORY_ERROR;
+  memcpy(zeros, &hdr, sizeof(hdr));
+
+  FILE *fh = fopen(fname, "wbc");
+  if (!fh) { free(zeros); return FILE_OPEN_ERROR; }
+  size_t wrote = fwrite(zeros, hdr.file_size, 1, fh);
+  fflush(fh);
+  fclose(fh);
+  free(zeros);
+  return (wrote == 1) ? 0 : FILE_WRITE_ERROR;
+}
+
+static int drop_table_data_file(const char *table_name) {
+  char fname[MAX_IDENT_LEN + 5] = {0};
+  snprintf(fname, sizeof(fname), "%s.tab", table_name);
+  if (remove(fname) == 0) return 0;
+  if (errno == ENOENT)    return 0;
+  return FILE_OPEN_ERROR;
+}
 
 int main(int argc, char** argv)
 {
@@ -331,6 +419,21 @@ int do_semantic(token_list *tok_list)
 		cur_cmd = LIST_SCHEMA;
 		cur = cur->next->next;
 	}
+	else if ((cur->tok_value == K_INSERT) &&
+			(cur->next != NULL) && (cur->next->tok_value == K_INTO))
+	{
+		printf("INSERT statement\n");
+		cur_cmd = INSERT;            // uses your enum (104)
+		cur = cur->next->next;       // point at <table_name>
+	}
+	else if ((cur->tok_value == K_SELECT) &&
+			(cur->next != NULL) && (cur->next->tok_value == S_STAR) &&
+			(cur->next->next != NULL) && (cur->next->next->tok_value == K_FROM))
+	{
+		printf("SELECT * statement\n");
+		cur_cmd = SELECT_STAR;            // uses your enum (107)
+		cur = cur->next;             // pass pointer starting at '*'
+	}
 	else
   {
 		printf("Invalid statement\n");
@@ -353,6 +456,12 @@ int do_semantic(token_list *tok_list)
 			case LIST_SCHEMA:
 						rc = sem_list_schema(cur);
 						break;
+			case INSERT:
+				rc = sem_insert_into(cur);
+				break;
+			case SELECT_STAR:
+				rc = sem_select_star(cur);
+				break;
 			default:
 					; /* no action */
 		}
@@ -614,6 +723,18 @@ int sem_create_table(token_list *t_list)
 	
 						rc = add_tpd_to_list(new_entry);
 
+						if (!rc) {
+							// create <table>.tab using the descriptor we just built
+							int frc = create_table_data_file(new_entry);
+							if (frc) rc = frc;
+						}
+
+						// (optional) refresh the in-memory catalog so future lookups work
+						if (!rc) {
+							int irc = initialize_tpd_list();
+							if (irc) rc = irc;
+						}
+
 						free(new_entry);
 					}
 				}
@@ -656,6 +777,10 @@ int sem_drop_table(token_list *t_list)
 			{
 				/* Found a valid tpd, drop it from tpd list */
 				rc = drop_tpd_from_list(cur->tok_string);
+				if (!rc) {
+					int frc = drop_table_data_file(cur->tok_string);
+					if (frc) rc = frc; // optional
+				}
 			}
 		}
 	}
@@ -833,6 +958,172 @@ int sem_list_schema(token_list *t_list)
 		} // Invalid table name
 	} // Invalid statement
 
+  return rc;
+}
+
+int sem_insert_into(token_list *t_list)
+{
+  int rc = 0;
+  token_list *cur = t_list;
+
+  // table name
+  if ((cur->tok_class != keyword) && (cur->tok_class != identifier) && (cur->tok_class != type_name))
+    { rc = INVALID_TABLE_NAME; cur->tok_value = INVALID; return rc; }
+
+  char tab_name[MAX_IDENT_LEN+1] = {0};
+  strcpy(tab_name, cur->tok_string);
+
+  tpd_entry *tpd = get_tpd_from_list(tab_name);
+  if (!tpd) { rc = TABLE_NOT_EXIST; cur->tok_value = INVALID; return rc; }
+
+  cur = cur->next;
+  if (cur->tok_value != K_VALUES) { rc = INVALID_STATEMENT; cur->tok_value = INVALID; return rc; }
+  cur = cur->next;
+  if (cur->tok_value != S_LEFT_PAREN) { rc = INVALID_STATEMENT; cur->tok_value = INVALID; return rc; }
+  cur = cur->next;
+
+  FILE *f = NULL; table_file_header hdr;
+  if ((rc = open_tab_rw(tab_name, &f, &hdr))) return rc;
+
+  if (hdr.num_records >= 100) { fclose(f); return MEMORY_ERROR; } // project cap
+
+  // prepare one record buffer
+  int rec_sz = hdr.record_size;
+  unsigned char *row = (unsigned char*)calloc(1, rec_sz);
+  if (!row) { fclose(f); return MEMORY_ERROR; }
+
+  cd_entry *col = (cd_entry*)((char*)tpd + tpd->cd_offset);
+  int off = 0;
+
+  for (int i = 0; i < tpd->num_columns; ++i, ++col)
+  {
+    // expect a value: STRING_LITERAL | INT_LITERAL | K_NULL
+    if ((cur->tok_value != STRING_LITERAL) && (cur->tok_value != INT_LITERAL) && (cur->tok_value != K_NULL))
+    { rc = INVALID_INSERT_DEFINITION; cur->tok_value = INVALID; break; }
+
+    if (cur->tok_value == K_NULL)
+    {
+      if (col->not_null) { rc = NOT_NULL_CONSTRAINT_VIOLATION; cur->tok_value = INVALID; break; }
+      row[off++] = 0; // length=0
+      // skip payload area
+      off += (col->col_type == T_INT) ? 4 : col->col_len;
+    }
+    else if (col->col_type == T_INT)
+    {
+      if (cur->tok_value != INT_LITERAL) { rc = TYPE_MISMATCH; cur->tok_value = INVALID; break; }
+      long val = strtol(cur->tok_string, NULL, 10);
+      row[off++] = 4; // length
+      int32_t iv = (int32_t)val;
+      memcpy(row + off, &iv, 4);
+      off += 4;
+    }
+    else // CHAR/VARCHAR(n) stored as fixed n with length tag
+    {
+      if (cur->tok_value != STRING_LITERAL) { rc = TYPE_MISMATCH; cur->tok_value = INVALID; break; }
+      int L = (int)strlen(cur->tok_string);
+      if (L <= 0 || L > col->col_len) { rc = INVALID_COLUMN_LENGTH; cur->tok_value = INVALID; break; }
+      row[off++] = (unsigned char)L;
+      memcpy(row + off, cur->tok_string, L);
+      off += col->col_len; // advance fixed area (rest stays zero)
+    }
+
+    cur = cur->next;
+
+    // comma or right paren
+    if (i < tpd->num_columns - 1)
+    {
+      if (cur->tok_value != S_COMMA) { rc = INVALID_INSERT_DEFINITION; cur->tok_value = INVALID; break; }
+      cur = cur->next;
+    }
+    else
+    {
+      if (cur->tok_value != S_RIGHT_PAREN) { rc = INVALID_INSERT_DEFINITION; cur->tok_value = INVALID; break; }
+      cur = cur->next;
+    }
+  }
+
+  if (!rc)
+  {
+    if (cur->tok_value != EOC) { rc = INVALID_STATEMENT; cur->tok_value = INVALID; }
+  }
+
+  if (!rc)
+  {
+    long pos = row_pos(&hdr, hdr.num_records);
+    fseek(f, pos, SEEK_SET);
+    if (fwrite(row, rec_sz, 1, f) != 1) rc = FILE_WRITE_ERROR;
+    else {
+      hdr.num_records += 1;
+      rc = write_header(f, &hdr);
+    }
+  }
+
+  free(row);
+  fclose(f);
+  return rc;
+}
+
+int sem_select_star(token_list *t_list)
+{
+  int rc = 0;
+  token_list *cur = t_list;           // points at '*'
+  if (cur->tok_value != S_STAR) { rc = INVALID_STATEMENT; cur->tok_value = INVALID; return rc; }
+  cur = cur->next;
+  if (cur->tok_value != K_FROM) { rc = INVALID_STATEMENT; cur->tok_value = INVALID; return rc; }
+  cur = cur->next;
+
+  if ((cur->tok_class != keyword) && (cur->tok_class != identifier) && (cur->tok_class != type_name))
+    { rc = INVALID_TABLE_NAME; cur->tok_value = INVALID; return rc; }
+
+  char tab_name[MAX_IDENT_LEN+1] = {0};
+  strcpy(tab_name, cur->tok_string);
+
+  tpd_entry *tpd = get_tpd_from_list(tab_name);
+  if (!tpd) { rc = TABLE_NOT_EXIST; cur->tok_value = INVALID; return rc; }
+
+  cur = cur->next;
+  if (cur->tok_value != EOC) { rc = INVALID_STATEMENT; cur->tok_value = INVALID; return rc; }
+
+  FILE *f = NULL; table_file_header hdr;
+  if ((rc = open_tab_rw(tab_name, &f, &hdr))) return rc;
+
+  cd_entry *cols = (cd_entry*)((char*)tpd + tpd->cd_offset);
+  // header row
+  for (int i=0;i<tpd->num_columns;i++)
+    printf("%s%s", cols[i].col_name, (i+1<tpd->num_columns)?" | ":"\n");
+
+  int rec_sz = hdr.record_size;
+  unsigned char *row = (unsigned char*)malloc(rec_sz);
+  if (!row) { fclose(f); return MEMORY_ERROR; }
+
+  for (int r=0; r<hdr.num_records; ++r)
+  {
+    fseek(f, row_pos(&hdr, r), SEEK_SET);
+    if (fread(row, rec_sz, 1, f) != 1) { rc = FILE_OPEN_ERROR; break; }
+
+    int off = 0;
+    for (int c=0;c<tpd->num_columns;c++)
+    {
+      unsigned char len = row[off++];
+
+      if (cols[c].col_type == T_INT)
+      {
+        if (len == 0) printf("NULL");
+        else { int32_t iv=0; memcpy(&iv, row+off, 4); printf("%d", iv); }
+        off += 4;
+      }
+      else
+      {
+        if (len == 0) printf("NULL");
+        else          printf("'%.*s'", (int)len, (char*)(row+off));
+        off += cols[c].col_len;
+      }
+      printf("%s", (c+1<tpd->num_columns)?" | ":"\n");
+    }
+  }
+
+  free(row);
+  fclose(f);
   return rc;
 }
 

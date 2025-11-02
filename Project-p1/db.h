@@ -143,7 +143,8 @@ typedef enum s_statement
   INSERT,                   // 104
   DELETE,                   // 105
   UPDATE,                   // 106
-  SELECT                    // 107
+  SELECT,                    // 107
+  SELECT_STAR                // 108
 } semantic_statement;
 
 /* This enum has a list of all the errors that should be detected
@@ -165,7 +166,12 @@ typedef enum error_return_codes
   /* Must add all the possible errors from I/U/D + SELECT here */
 	FILE_OPEN_ERROR = -299,			// -299
 	DBFILE_CORRUPTION,					// -298
-	MEMORY_ERROR							  // -297
+	MEMORY_ERROR,							  // -297
+	TYPE_MISMATCH,              // -296
+	NOT_NULL_CONSTRAINT_VIOLATION, // -295
+	INVALID_INSERT_DEFINITION,      // -294
+	FILE_WRITE_ERROR,               // -293
+
 } return_codes;
 
 /* Set of function prototypes */
@@ -176,6 +182,8 @@ int sem_create_table(token_list *t_list);
 int sem_drop_table(token_list *t_list);
 int sem_list_tables();
 int sem_list_schema(token_list *t_list);
+int sem_insert_into(token_list *t_list);
+int sem_select_star(token_list *t_list);
 
 /*
 	Keep a global list of tpd - in real life, this will be stored
