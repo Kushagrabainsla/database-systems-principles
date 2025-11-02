@@ -51,16 +51,9 @@ CREATE TRIGGER hw3.classcheck
 NO CASCADE BEFORE INSERT ON hw3.schedule
 REFERENCING NEW AS N
 FOR EACH ROW MODE DB2SQL
-classchecktriggerblock: BEGIN ATOMIC
-     -- Declarations (must come before executable statements in DB2 SQL PL)
-     DECLARE V_MISSING INT DEFAULT 0;
-     DECLARE V_INPROGRESS INT DEFAULT 0;
-
-     -- Only enforce prereqs when a student is registering (grade is NULL).
-     -- Allow inserting historical/completed grades (grade IS NOT NULL) for data seeding/testing (hw3.sql).
-     IF N.GRADE IS NOT NULL THEN
-        LEAVE classchecktriggerblock;
-     END IF;
+BEGIN ATOMIC
+    DECLARE V_MISSING INT DEFAULT 0;
+    DECLARE V_INPROGRESS INT DEFAULT 0;
 
     -- 1) Any pre-req being taken with no grade yet? -> reject
     SET V_INPROGRESS = (
@@ -97,7 +90,7 @@ classchecktriggerblock: BEGIN ATOMIC
     SIGNAL SQLSTATE '75001'
         SET MESSAGE_TEXT = 'Missing Pre-req';
     END IF;
-END classchecktriggerblock^
+END^
 
 
 terminate^
