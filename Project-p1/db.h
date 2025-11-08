@@ -9,6 +9,17 @@ db.h - This file contains all the structures, defines, and function
 #define KEYWORD_OFFSET	10
 #define STRING_BREAK		" (),<>="
 #define NUMBER_BREAK		" ),"
+#define MAX_ROWS 100
+
+
+typedef struct table_file_header_def {
+	int32_t file_size;
+	int32_t record_size;
+	int32_t num_records;
+	int32_t record_offset;
+	int32_t file_header_flag;
+	int64_t tpd_ptr; // MUST be 0 on disk
+} table_file_header;
 
 /* Column descriptor sturcture = 20+4+4+4+4 = 36 bytes */
 typedef struct cd_entry_def
@@ -101,10 +112,12 @@ typedef enum t_value
   K_DESC,       // 33
   K_IS,         // 34
   K_AND,        // 35
-  K_OR,         // 36 - new keyword should be added below this line
-  F_SUM,        // 37
-  F_AVG,        // 38
-	F_COUNT,      // 39 - new function name should be added below this line
+  K_OR,         // 36
+  K_NATURAL,    // 37
+  K_JOIN,       // 38 - new keyword should be added below this line
+  F_SUM,        // 39
+  F_AVG,        // 40
+	F_COUNT,      // 41 - new function name should be added below this line
 	S_LEFT_PAREN = 70,  // 70
 	S_RIGHT_PAREN,		  // 71
 	S_COMMA,			      // 72
@@ -120,7 +133,7 @@ typedef enum t_value
 } token_value;
 
 /* This constants must be updated when add new keywords */
-#define TOTAL_KEYWORDS_PLUS_TYPE_NAMES 30
+#define TOTAL_KEYWORDS_PLUS_TYPE_NAMES 32
 
 /* New keyword must be added in the same position/order as the enum
    definition above, otherwise the lookup will be wrong */
@@ -129,6 +142,7 @@ char *keyword_table[] =
   "int", "varchar", "char", "create", "table", "not", "null", "drop", "list", "schema",
   "for", "to", "insert", "into", "values", "delete", "from", "where", 
   "update", "set", "select", "order", "by", "desc", "is", "and", "or",
+  "natural", "join",
   "sum", "avg", "count"
 };
 
@@ -184,6 +198,7 @@ int sem_list_tables();
 int sem_list_schema(token_list *t_list);
 int sem_insert_into(token_list *t_list);
 int sem_select_star(token_list *t_list);
+int sem_select_natural_join(tpd_entry *tpd1, tpd_entry *tpd2, const char *tab1, const char *tab2);
 
 /*
 	Keep a global list of tpd - in real life, this will be stored

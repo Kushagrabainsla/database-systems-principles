@@ -16,91 +16,6 @@
 #define strcasecmp _stricmp
 #endif
 
-#define MAX_ROWS 100
-
-typedef struct table_file_header_def {
-  int32_t file_size;
-  int32_t record_size;
-  int32_t num_records;
-  int32_t record_offset;
-  int32_t file_header_flag;
-  int64_t tpd_ptr; // MUST be 0 on disk
-} table_file_header;
-
-static int open_tab_rw(const char *table_name, FILE **pf, table_file_header *hdr)
-{
-  char fname[MAX_IDENT_LEN + 5] = {0};
-  snprintf(fname, sizeof(fname), "%s.tab", table_name);
-
-  *pf = fopen(fname, "rb+");         // read/write binary
-  if (!*pf) return FILE_OPEN_ERROR;
-
-  fseek(*pf, 0, SEEK_SET);
-  if (fread(hdr, sizeof(*hdr), 1, *pf) != 1) { fclose(*pf); *pf = NULL; return FILE_OPEN_ERROR; }
-  return 0;
-}
-
-static int write_header(FILE *f, const table_file_header *hdr_in)
-{
-  table_file_header on_disk = *hdr_in;
-  on_disk.tpd_ptr = 0; // zero when writing
-  fseek(f, 0, SEEK_SET);
-  if (fwrite(&on_disk, sizeof(on_disk), 1, f) != 1) return FILE_WRITE_ERROR;
-  fflush(f);
-  return 0;
-}
-
-static long row_pos(const table_file_header *hdr, int row_idx)
-{
-  return (long)hdr->record_offset + (long)row_idx * (long)hdr->record_size;
-}
-
-static inline int round4(int n) { return (n + 3) & ~3; }
-
-static int compute_record_size_from_tpd(const tpd_entry *tpd) {
-  int rec = 0;
-  const cd_entry *col = (const cd_entry*)((const char*)tpd + tpd->cd_offset);
-  for (int i = 0; i < tpd->num_columns; ++i, ++col) {
-    if (col->col_type == T_INT) rec += 1 + 4;          // 1-byte length + 4
-    else                        rec += 1 + col->col_len; // CHAR/VARCHAR(n)
-  }
-  return round4(rec);
-}
-
-static int create_table_data_file(const tpd_entry *tpd) {
-  char fname[MAX_IDENT_LEN + 5] = {0};
-  snprintf(fname, sizeof(fname), "%s.tab", tpd->table_name);
-
-  int rec_size = compute_record_size_from_tpd(tpd);
-
-  table_file_header hdr = {0};
-  hdr.record_size    = rec_size;
-  hdr.num_records    = 0;
-  hdr.record_offset  = sizeof(table_file_header);
-  hdr.file_size      = hdr.record_offset + rec_size * MAX_ROWS;
-  hdr.file_header_flag = 0;
-  hdr.tpd_ptr        = 0; // zero on disk
-
-  char *zeros = (char*)calloc(1, hdr.file_size);
-  if (!zeros) return MEMORY_ERROR;
-  memcpy(zeros, &hdr, sizeof(hdr));
-
-  FILE *fh = fopen(fname, "wbc");
-  if (!fh) { free(zeros); return FILE_OPEN_ERROR; }
-  size_t wrote = fwrite(zeros, hdr.file_size, 1, fh);
-  fflush(fh);
-  fclose(fh);
-  free(zeros);
-  return (wrote == 1) ? 0 : FILE_WRITE_ERROR;
-}
-
-static int drop_table_data_file(const char *table_name) {
-  char fname[MAX_IDENT_LEN + 5] = {0};
-  snprintf(fname, sizeof(fname), "%s.tab", table_name);
-  if (remove(fname) == 0) return 0;
-  if (errno == ENOENT)    return 0;
-  return FILE_OPEN_ERROR;
-}
 
 int main(int argc, char** argv)
 {
@@ -724,12 +639,12 @@ int sem_create_table(token_list *t_list)
 						rc = add_tpd_to_list(new_entry);
 
 						if (!rc) {
-							// create <table>.tab using the descriptor we just built
+							/* Create <table>.tab using the descriptor we just built before */
 							int frc = create_table_data_file(new_entry);
 							if (frc) rc = frc;
 						}
 
-						// (optional) refresh the in-memory catalog so future lookups work
+						/* Refresh the in-memory catalog so that future lookups work */
 						if (!rc) {
 							int irc = initialize_tpd_list();
 							if (irc) rc = irc;
@@ -779,7 +694,7 @@ int sem_drop_table(token_list *t_list)
 				rc = drop_tpd_from_list(cur->tok_string);
 				if (!rc) {
 					int frc = drop_table_data_file(cur->tok_string);
-					if (frc) rc = frc; // optional
+					if (frc) rc = frc;
 				}
 			}
 		}
@@ -963,168 +878,315 @@ int sem_list_schema(token_list *t_list)
 
 int sem_insert_into(token_list *t_list)
 {
-  int rc = 0;
-  token_list *cur = t_list;
+	int rc = 0;
+	token_list *current_token = t_list;
 
-  // table name
-  if ((cur->tok_class != keyword) && (cur->tok_class != identifier) && (cur->tok_class != type_name))
-    { rc = INVALID_TABLE_NAME; cur->tok_value = INVALID; return rc; }
+	// table name
+	if ((current_token->tok_class != keyword) && (current_token->tok_class != identifier) && (current_token->tok_class != type_name)) {
+		rc = INVALID_TABLE_NAME;
+		current_token->tok_value = INVALID;
+		return rc;
+	}
 
-  char tab_name[MAX_IDENT_LEN+1] = {0};
-  strcpy(tab_name, cur->tok_string);
+	char table_name[MAX_IDENT_LEN+1] = {0};
+	strcpy(table_name, current_token->tok_string);
 
-  tpd_entry *tpd = get_tpd_from_list(tab_name);
-  if (!tpd) { rc = TABLE_NOT_EXIST; cur->tok_value = INVALID; return rc; }
+	tpd_entry *table_descriptor = get_tpd_from_list(table_name);
+	if (!table_descriptor) {
+		rc = TABLE_NOT_EXIST;
+		current_token->tok_value = INVALID;
+		return rc;
+	}
 
-  cur = cur->next;
-  if (cur->tok_value != K_VALUES) { rc = INVALID_STATEMENT; cur->tok_value = INVALID; return rc; }
-  cur = cur->next;
-  if (cur->tok_value != S_LEFT_PAREN) { rc = INVALID_STATEMENT; cur->tok_value = INVALID; return rc; }
-  cur = cur->next;
+	current_token = current_token->next;
+	if (current_token->tok_value != K_VALUES) {
+		rc = INVALID_STATEMENT;
+		current_token->tok_value = INVALID;
+		return rc;
+	}
+	current_token = current_token->next;
+	if (current_token->tok_value != S_LEFT_PAREN) {
+		rc = INVALID_STATEMENT;
+		current_token->tok_value = INVALID;
+		return rc;
+	}
+	current_token = current_token->next;
 
-  FILE *f = NULL; table_file_header hdr;
-  if ((rc = open_tab_rw(tab_name, &f, &hdr))) return rc;
+	FILE *table_file = NULL; 
+	table_file_header file_header;
+	if ((rc = open_tab_rw(table_name, &table_file, &file_header))) return rc;
 
-  if (hdr.num_records >= 100) { fclose(f); return MEMORY_ERROR; } // project cap
+	if (file_header.num_records >= 100) {
+		fclose(table_file);
+		return MEMORY_ERROR;
+	} // project cap
 
-  // prepare one record buffer
-  int rec_sz = hdr.record_size;
-  unsigned char *row = (unsigned char*)calloc(1, rec_sz);
-  if (!row) { fclose(f); return MEMORY_ERROR; }
+	// prepare one record buffer
+	int record_size = file_header.record_size;
+	unsigned char *row_buffer = (unsigned char*)calloc(1, record_size);
+	if (!row_buffer) {
+		fclose(table_file);
+		return MEMORY_ERROR;
+	}
 
-  cd_entry *col = (cd_entry*)((char*)tpd + tpd->cd_offset);
-  int off = 0;
+	cd_entry *current_column = (cd_entry*)((char*)table_descriptor + table_descriptor->cd_offset);
+	int buffer_offset = 0;
 
-  for (int i = 0; i < tpd->num_columns; ++i, ++col)
-  {
-    // expect a value: STRING_LITERAL | INT_LITERAL | K_NULL
-    if ((cur->tok_value != STRING_LITERAL) && (cur->tok_value != INT_LITERAL) && (cur->tok_value != K_NULL))
-    { rc = INVALID_INSERT_DEFINITION; cur->tok_value = INVALID; break; }
+	for (int column_index = 0; column_index < table_descriptor->num_columns; ++column_index, ++current_column) {
+		// expect a value: STRING_LITERAL | INT_LITERAL | K_NULL
+		if ((current_token->tok_value != STRING_LITERAL) && (current_token->tok_value != INT_LITERAL) && (current_token->tok_value != K_NULL)) {
+			rc = INVALID_INSERT_DEFINITION;
+			current_token->tok_value = INVALID;
+			break;
+		}
 
-    if (cur->tok_value == K_NULL)
-    {
-      if (col->not_null) { rc = NOT_NULL_CONSTRAINT_VIOLATION; cur->tok_value = INVALID; break; }
-      row[off++] = 0; // length=0
-      // skip payload area
-      off += (col->col_type == T_INT) ? 4 : col->col_len;
-    }
-    else if (col->col_type == T_INT)
-    {
-      if (cur->tok_value != INT_LITERAL) { rc = TYPE_MISMATCH; cur->tok_value = INVALID; break; }
-      long val = strtol(cur->tok_string, NULL, 10);
-      row[off++] = 4; // length
-      int32_t iv = (int32_t)val;
-      memcpy(row + off, &iv, 4);
-      off += 4;
-    }
-    else // CHAR/VARCHAR(n) stored as fixed n with length tag
-    {
-      if (cur->tok_value != STRING_LITERAL) { rc = TYPE_MISMATCH; cur->tok_value = INVALID; break; }
-      int L = (int)strlen(cur->tok_string);
-      if (L <= 0 || L > col->col_len) { rc = INVALID_COLUMN_LENGTH; cur->tok_value = INVALID; break; }
-      row[off++] = (unsigned char)L;
-      memcpy(row + off, cur->tok_string, L);
-      off += col->col_len; // advance fixed area (rest stays zero)
-    }
+		if (current_token->tok_value == K_NULL) {
+			if (current_column->not_null) { rc = NOT_NULL_CONSTRAINT_VIOLATION; current_token->tok_value = INVALID; break; }
+			row_buffer[buffer_offset++] = 0; // length=0
+			// skip payload area
+			buffer_offset += (current_column->col_type == T_INT) ? 4 : current_column->col_len;
+		} else if (current_column->col_type == T_INT) {
+			if (current_token->tok_value != INT_LITERAL) { rc = TYPE_MISMATCH; current_token->tok_value = INVALID; break; }
+			long parsed_value = strtol(current_token->tok_string, NULL, 10);
+			row_buffer[buffer_offset++] = 4; // length
+			int32_t int_value = (int32_t)parsed_value;
+			memcpy(row_buffer + buffer_offset, &int_value, 4);
+			buffer_offset += 4;
+		} else {
+			// CHAR/VARCHAR(n) stored as fixed n with length tag
+			if (current_token->tok_value != STRING_LITERAL) { rc = TYPE_MISMATCH; current_token->tok_value = INVALID; break; }
+			int string_length = (int)strlen(current_token->tok_string);
+			if (string_length <= 0 || string_length > current_column->col_len) { rc = INVALID_COLUMN_LENGTH; current_token->tok_value = INVALID; break; }
+			row_buffer[buffer_offset++] = (unsigned char)string_length;
+			memcpy(row_buffer + buffer_offset, current_token->tok_string, string_length);
+			buffer_offset += current_column->col_len; // advance fixed area (rest stays zero)
+		}
 
-    cur = cur->next;
+		current_token = current_token->next;
 
-    // comma or right paren
-    if (i < tpd->num_columns - 1)
-    {
-      if (cur->tok_value != S_COMMA) { rc = INVALID_INSERT_DEFINITION; cur->tok_value = INVALID; break; }
-      cur = cur->next;
-    }
-    else
-    {
-      if (cur->tok_value != S_RIGHT_PAREN) { rc = INVALID_INSERT_DEFINITION; cur->tok_value = INVALID; break; }
-      cur = cur->next;
-    }
-  }
+		// comma or right paren
+		if (column_index < table_descriptor->num_columns - 1) {
+			if (current_token->tok_value != S_COMMA) { rc = INVALID_INSERT_DEFINITION; current_token->tok_value = INVALID; break; }
+			current_token = current_token->next;
+		} else {
+			if (current_token->tok_value != S_RIGHT_PAREN) { rc = INVALID_INSERT_DEFINITION; current_token->tok_value = INVALID; break; }
+			current_token = current_token->next;
+		}
+	}
 
-  if (!rc)
-  {
-    if (cur->tok_value != EOC) { rc = INVALID_STATEMENT; cur->tok_value = INVALID; }
-  }
+	if (!rc) {
+		if (current_token->tok_value != EOC) { rc = INVALID_STATEMENT; current_token->tok_value = INVALID; }
+	}
 
-  if (!rc)
-  {
-    long pos = row_pos(&hdr, hdr.num_records);
-    fseek(f, pos, SEEK_SET);
-    if (fwrite(row, rec_sz, 1, f) != 1) rc = FILE_WRITE_ERROR;
-    else {
-      hdr.num_records += 1;
-      rc = write_header(f, &hdr);
-    }
-  }
+	if (!rc) {
+		long write_position = row_pos(&file_header, file_header.num_records);
+		fseek(table_file, write_position, SEEK_SET);
+		if (fwrite(row_buffer, record_size, 1, table_file) != 1) rc = FILE_WRITE_ERROR;
+		else {
+			file_header.num_records += 1;
+			rc = write_header(table_file, &file_header);
+		}
+	}
 
-  free(row);
-  fclose(f);
-  return rc;
+	free(row_buffer);
+	fclose(table_file);
+	return rc;
 }
 
 int sem_select_star(token_list *t_list)
 {
-  int rc = 0;
-  token_list *cur = t_list;           // points at '*'
-  if (cur->tok_value != S_STAR) { rc = INVALID_STATEMENT; cur->tok_value = INVALID; return rc; }
-  cur = cur->next;
-  if (cur->tok_value != K_FROM) { rc = INVALID_STATEMENT; cur->tok_value = INVALID; return rc; }
-  cur = cur->next;
+	int rc = 0;
+	token_list *current_token = t_list;           // points at '*'
+	if (current_token->tok_value != S_STAR) {
+		rc = INVALID_STATEMENT;
+		current_token->tok_value = INVALID;
+		return rc;
+	}
+	current_token = current_token->next;
+	if (current_token->tok_value != K_FROM) {
+		rc = INVALID_STATEMENT;
+		current_token->tok_value = INVALID;
+		return rc;
+	}
+	current_token = current_token->next;
 
-  if ((cur->tok_class != keyword) && (cur->tok_class != identifier) && (cur->tok_class != type_name))
-    { rc = INVALID_TABLE_NAME; cur->tok_value = INVALID; return rc; }
+	if ((current_token->tok_class != keyword) && (current_token->tok_class != identifier) && (current_token->tok_class != type_name)) {
+		rc = INVALID_TABLE_NAME;
+		current_token->tok_value = INVALID;
+		return rc;
+	}
 
-  char tab_name[MAX_IDENT_LEN+1] = {0};
-  strcpy(tab_name, cur->tok_string);
+	char table_name[MAX_IDENT_LEN+1] = {0};
+	strcpy(table_name, current_token->tok_string);
 
-  tpd_entry *tpd = get_tpd_from_list(tab_name);
-  if (!tpd) { rc = TABLE_NOT_EXIST; cur->tok_value = INVALID; return rc; }
+	tpd_entry *table_descriptor = get_tpd_from_list(table_name);
+	if (!table_descriptor) { rc = TABLE_NOT_EXIST; current_token->tok_value = INVALID; return rc; }
 
-  cur = cur->next;
-  if (cur->tok_value != EOC) { rc = INVALID_STATEMENT; cur->tok_value = INVALID; return rc; }
+	current_token = current_token->next;
+	
+	// Check for NATURAL JOIN
+	bool has_join = false;
+	char table_name2[MAX_IDENT_LEN+1] = {0};
+	tpd_entry *table_descriptor2 = NULL;
+	
+	if (current_token->tok_value == K_NATURAL) {
+		has_join = true;
+		current_token = current_token->next;
+		
+		if (current_token->tok_value != K_JOIN) {
+			rc = INVALID_STATEMENT;
+			current_token->tok_value = INVALID;
+			return rc;
+		}
+		current_token = current_token->next;
+		
+		if ((current_token->tok_class != keyword) && (current_token->tok_class != identifier) && (current_token->tok_class != type_name)) {
+			rc = INVALID_TABLE_NAME;
+			current_token->tok_value = INVALID;
+			return rc;
+		}
+		
+		strcpy(table_name2, current_token->tok_string);
+		table_descriptor2 = get_tpd_from_list(table_name2);
+		if (!table_descriptor2) { rc = TABLE_NOT_EXIST; current_token->tok_value = INVALID; return rc; }
+		
+		current_token = current_token->next;
+	}
+	
+	if (current_token->tok_value != EOC) {
+		rc = INVALID_STATEMENT;
+		current_token->tok_value = INVALID;
+		return rc;
+	}
 
-  FILE *f = NULL; table_file_header hdr;
-  if ((rc = open_tab_rw(tab_name, &f, &hdr))) return rc;
+	if (!has_join) {
+		// Single table SELECT - original logic
+		FILE *table_file = NULL; 
+		table_file_header file_header;
+		if ((rc = open_tab_rw(table_name, &table_file, &file_header))) return rc;
 
-  cd_entry *cols = (cd_entry*)((char*)tpd + tpd->cd_offset);
-  // header row
-  for (int i=0;i<tpd->num_columns;i++)
-    printf("%s%s", cols[i].col_name, (i+1<tpd->num_columns)?" | ":"\n");
+		cd_entry *column_descriptors = (cd_entry*)((char*)table_descriptor + table_descriptor->cd_offset);
+		// header row
+		for (int column_index = 0; column_index < table_descriptor->num_columns; column_index++)
+			printf("%s%s", column_descriptors[column_index].col_name, (column_index + 1 < table_descriptor->num_columns) ? " | " : "\n");
 
-  int rec_sz = hdr.record_size;
-  unsigned char *row = (unsigned char*)malloc(rec_sz);
-  if (!row) { fclose(f); return MEMORY_ERROR; }
+		int record_size = file_header.record_size;
+		unsigned char *row_buffer = (unsigned char*)malloc(record_size);
+		if (!row_buffer) { fclose(table_file); return MEMORY_ERROR; }
 
-  for (int r=0; r<hdr.num_records; ++r)
-  {
-    fseek(f, row_pos(&hdr, r), SEEK_SET);
-    if (fread(row, rec_sz, 1, f) != 1) { rc = FILE_OPEN_ERROR; break; }
+		for (int row_index = 0; row_index < file_header.num_records; ++row_index) {
+			fseek(table_file, row_pos(&file_header, row_index), SEEK_SET);
+			if (fread(row_buffer, record_size, 1, table_file) != 1) { rc = FILE_OPEN_ERROR; break; }
 
-    int off = 0;
-    for (int c=0;c<tpd->num_columns;c++)
-    {
-      unsigned char len = row[off++];
+			int buffer_offset = 0;
+			for (int column_index = 0; column_index < table_descriptor->num_columns; column_index++) {
+				unsigned char field_length = row_buffer[buffer_offset++];
 
-      if (cols[c].col_type == T_INT)
-      {
-        if (len == 0) printf("NULL");
-        else { int32_t iv=0; memcpy(&iv, row+off, 4); printf("%d", iv); }
-        off += 4;
-      }
-      else
-      {
-        if (len == 0) printf("NULL");
-        else          printf("'%.*s'", (int)len, (char*)(row+off));
-        off += cols[c].col_len;
-      }
-      printf("%s", (c+1<tpd->num_columns)?" | ":"\n");
-    }
-  }
+				if (column_descriptors[column_index].col_type == T_INT) {
+					if (field_length == 0) printf("NULL");
+					else { int32_t int_value = 0; memcpy(&int_value, row_buffer + buffer_offset, 4); printf("%d", int_value); }
+					buffer_offset += 4;
+				} else {
+					if (field_length == 0) printf("NULL");
+					else printf("'%.*s'", (int)field_length, (char*)(row_buffer + buffer_offset));
+					buffer_offset += column_descriptors[column_index].col_len;
+				}
+				printf("%s", (column_index + 1 < table_descriptor->num_columns) ? " | " : "\n");
+			}
+		}
 
-  free(row);
-  fclose(f);
-  return rc;
+		free(row_buffer);
+		fclose(table_file);
+		
+	} else {
+		// NATURAL JOIN logic
+		rc = sem_select_natural_join(table_descriptor, table_descriptor2, table_name, table_name2);
+	}
+	
+	return rc;
+}
+
+/* Perform NATURAL JOIN on two tables */
+int sem_select_natural_join(tpd_entry *tpd1, tpd_entry *tpd2, const char *table_name1, const char *table_name2)
+{
+	int rc = 0;
+	
+	// Find common columns
+	int common_map1[MAX_NUM_COL];
+	int common_map2[MAX_NUM_COL];
+	int num_common = find_common_columns(tpd1, tpd2, common_map1, common_map2);
+	
+	if (num_common == 0) {
+		printf("Warning: No common columns found for NATURAL JOIN\n");
+		return 0;
+	}
+	
+	// Open both table files
+	FILE *file1 = NULL, *file2 = NULL;
+	table_file_header header1, header2;
+	
+	if ((rc = open_tab_rw(table_name1, &file1, &header1))) {
+		return rc;
+	}
+	
+	if ((rc = open_tab_rw(table_name2, &file2, &header2))) {
+		fclose(file1);
+		return rc;
+	}
+	
+	// Allocate row buffers
+	unsigned char *row_buffer1 = (unsigned char*)malloc(header1.record_size);
+	unsigned char *row_buffer2 = (unsigned char*)malloc(header2.record_size);
+	
+	if (!row_buffer1 || !row_buffer2) {
+		free(row_buffer1);
+		free(row_buffer2);
+		fclose(file1);
+		fclose(file2);
+		return MEMORY_ERROR;
+	}
+	
+	// Print header row
+	print_join_header(tpd1, tpd2, common_map1, common_map2, num_common);
+	
+	// Perform nested loop join
+	cd_entry *cols1 = (cd_entry*)((char*)tpd1 + tpd1->cd_offset);
+	cd_entry *cols2 = (cd_entry*)((char*)tpd2 + tpd2->cd_offset);
+	
+	for (int row_idx1 = 0; row_idx1 < header1.num_records; row_idx1++) {
+		fseek(file1, row_pos(&header1, row_idx1), SEEK_SET);
+		if (fread(row_buffer1, header1.record_size, 1, file1) != 1) {
+			rc = FILE_OPEN_ERROR;
+			break;
+		}
+		
+		for (int row_idx2 = 0; row_idx2 < header2.num_records; row_idx2++) {
+			fseek(file2, row_pos(&header2, row_idx2), SEEK_SET);
+			if (fread(row_buffer2, header2.record_size, 1, file2) != 1) {
+				rc = FILE_OPEN_ERROR;
+				break;
+			}
+			
+			// Check if rows match on common columns
+			if (rows_match_on_common_columns(
+				row_buffer1, row_buffer2, 
+			    cols1, cols2,
+			    common_map1, common_map2, num_common
+			)) {
+				print_joined_row(row_buffer1, row_buffer2, tpd1, tpd2, common_map1, common_map2, num_common);
+			}
+		}
+		
+		if (rc) break;
+	}
+	
+	// Cleanup
+	free(row_buffer1);
+	free(row_buffer2);
+	fclose(file1);
+	fclose(file2);
+	
+	return rc;
 }
 
 int initialize_tpd_list()
@@ -1332,6 +1394,318 @@ int drop_tpd_from_list(char *tabname)
 	}
 
 	return rc;
+}
+
+static int open_tab_rw(const char *table_name, FILE **pf, table_file_header *hdr)
+{
+	char fname[MAX_IDENT_LEN + 5] = {0};
+	snprintf(fname, sizeof(fname), "%s.tab", table_name);
+
+	*pf = fopen(fname, "rb+");         // read/write binary
+	if (!*pf) return FILE_OPEN_ERROR;
+
+	fseek(*pf, 0, SEEK_SET);
+	if (fread(hdr, sizeof(*hdr), 1, *pf) != 1) {
+		fclose(*pf); *pf = NULL;
+		return FILE_OPEN_ERROR;
+	}
+	return 0;
+}
+
+static int write_header(FILE *f, const table_file_header *hdr_in)
+{
+	table_file_header on_disk = *hdr_in;
+	on_disk.tpd_ptr = 0; // zero when writing
+	fseek(f, 0, SEEK_SET);
+	if (fwrite(&on_disk, sizeof(on_disk), 1, f) != 1) return FILE_WRITE_ERROR;
+	fflush(f);
+	return 0;
+}
+
+static long row_pos(const table_file_header *hdr, int row_idx)
+{
+  	return (long)hdr->record_offset + (long)row_idx * (long)hdr->record_size;
+}
+
+static inline int round4(int n) { return (n + 3) & ~3; }
+
+static int compute_record_size_from_tpd(const tpd_entry *tpd) {
+	int rec = 0;
+	const cd_entry *col = (const cd_entry*)((const char*)tpd + tpd->cd_offset);
+	for (int i = 0; i < tpd->num_columns; ++i, ++col) {
+		if (col->col_type == T_INT) rec += 1 + 4; // 1-byte length + 4
+		else rec += 1 + col->col_len; // CHAR/VARCHAR(n)
+	}
+	return round4(rec);
+}
+
+static int create_table_data_file(const tpd_entry *tpd) {
+	char fname[MAX_IDENT_LEN + 5] = {0};
+	snprintf(fname, sizeof(fname), "%s.tab", tpd->table_name);
+
+	int rec_size = compute_record_size_from_tpd(tpd);
+
+	table_file_header hdr = {0};
+	hdr.record_size    = rec_size;
+	hdr.num_records    = 0;
+	hdr.record_offset  = sizeof(table_file_header);
+	hdr.file_size      = hdr.record_offset + rec_size * MAX_ROWS;
+	hdr.file_header_flag = 0;
+	hdr.tpd_ptr        = 0; // zero on disk
+
+	char *zeros = (char*)calloc(1, hdr.file_size);
+	if (!zeros) return MEMORY_ERROR;
+	memcpy(zeros, &hdr, sizeof(hdr));
+
+	FILE *fh = fopen(fname, "wbc");
+	if (!fh) { free(zeros); return FILE_OPEN_ERROR; }
+	size_t wrote = fwrite(zeros, hdr.file_size, 1, fh);
+	fflush(fh);
+	fclose(fh);
+	free(zeros);
+	return (wrote == 1) ? 0 : FILE_WRITE_ERROR;
+}
+
+static int drop_table_data_file(const char *table_name) {
+	char fname[MAX_IDENT_LEN + 5] = {0};
+	snprintf(fname, sizeof(fname), "%s.tab", table_name);
+	if (remove(fname) == 0) return 0;
+	if (errno == ENOENT)    return 0;
+	return FILE_OPEN_ERROR;
+}
+
+
+/* Extract a field value from a row buffer at the specified column index */
+static void extract_field_at_column(unsigned char *row_buffer, cd_entry *columns, int col_index, unsigned char *str_value, int *int_value, unsigned char *length)
+{
+	int offset = 0;
+	
+	// Calculate offset to the target column
+	for (int i = 0; i < col_index; i++) {
+		offset += 1 + ((columns[i].col_type == T_INT) ? 4 : columns[i].col_len);
+	}
+	
+	// Read length byte
+	*length = row_buffer[offset++];
+	
+	// Read the actual value
+	if (columns[col_index].col_type == T_INT) {
+		if (*length > 0) {
+			memcpy(int_value, row_buffer + offset, 4);
+		} else {
+			*int_value = 0; // NULL
+		}
+	} else {
+		if (*length > 0) {
+			memcpy(str_value, row_buffer + offset, *length);
+		}
+	}
+}
+
+/* Compare two field values for equality */
+static bool are_fields_equal(cd_entry *col, unsigned char len1, void *val1, unsigned char len2, void *val2)
+{
+	// Both NULL
+	if (len1 == 0 && len2 == 0) return true;
+	
+	// One NULL, one not
+	if (len1 == 0 || len2 == 0) return false;
+	
+	// Compare based on type
+	if (col->col_type == T_INT) {
+		return *(int32_t*)val1 == *(int32_t*)val2;
+	} else {
+		return (len1 == len2) && (memcmp(val1, val2, len1) == 0);
+	}
+}
+
+/**
+ * Print a single field value
+ */
+static void print_field(cd_entry *col, unsigned char length, void *value)
+{
+	if (length == 0) {
+		printf("NULL");
+	} else if (col->col_type == T_INT) {
+		printf("%d", *(int32_t*)value);
+	} else {
+		printf("'%.*s'", (int)length, (char*)value);
+	}
+}
+
+/**
+ * Find common columns between two tables for NATURAL JOIN
+ */
+static int find_common_columns(tpd_entry *tpd1, tpd_entry *tpd2, int *col_map1, int *col_map2)
+{
+	cd_entry *cols1 = (cd_entry*)((char*)tpd1 + tpd1->cd_offset);
+	cd_entry *cols2 = (cd_entry*)((char*)tpd2 + tpd2->cd_offset);
+	int num_common = 0;
+	
+	for (int i = 0; i < tpd1->num_columns; i++) {
+		for (int j = 0; j < tpd2->num_columns; j++) {
+			if (strcmp(cols1[i].col_name, cols2[j].col_name) == 0) {
+				col_map1[num_common] = i;
+				col_map2[num_common] = j;
+				num_common++;
+				break;
+			}
+		}
+	}
+	
+	return num_common;
+}
+
+/**
+ * Print the header row for NATURAL JOIN result
+ * Format: common columns | remaining table1 columns | remaining table2 columns
+ */
+static void print_join_header(tpd_entry *tpd1, tpd_entry *tpd2,  int *common_map1, int *common_map2, int num_common)
+{
+	cd_entry *cols1 = (cd_entry*)((char*)tpd1 + tpd1->cd_offset);
+	cd_entry *cols2 = (cd_entry*)((char*)tpd2 + tpd2->cd_offset);
+	bool first = true;
+	
+	// Print common columns first
+	for (int i = 0; i < num_common; i++) {
+		if (!first) printf(" | ");
+		printf("%s", cols1[common_map1[i]].col_name);
+		first = false;
+	}
+	
+	// Print remaining columns from table1
+	for (int i = 0; i < tpd1->num_columns; i++) {
+		bool is_common = false;
+		for (int c = 0; c < num_common; c++) {
+			if (common_map1[c] == i) {
+				is_common = true;
+				break;
+			}
+		}
+		if (!is_common) {
+			if (!first) printf(" | ");
+			printf("%s", cols1[i].col_name);
+			first = false;
+		}
+	}
+	
+	// Print remaining columns from table2
+	for (int i = 0; i < tpd2->num_columns; i++) {
+		bool is_common = false;
+		for (int c = 0; c < num_common; c++) {
+			if (common_map2[c] == i) {
+				is_common = true;
+				break;
+			}
+		}
+		if (!is_common) {
+			if (!first) printf(" | ");
+			printf("%s", cols2[i].col_name);
+			first = false;
+		}
+	}
+	
+	printf("\n");
+}
+
+/* Check if two rows match on all common columns */
+static bool rows_match_on_common_columns(unsigned char *row1, unsigned char *row2, cd_entry *cols1, cd_entry *cols2, int *common_map1, int *common_map2, int num_common)
+{
+	for (int c = 0; c < num_common; c++) {
+		int idx1 = common_map1[c];
+		int idx2 = common_map2[c];
+		
+		unsigned char len1, len2;
+		unsigned char str_val1[256] = {0}, str_val2[256] = {0};
+		int int_val1 = 0, int_val2 = 0;
+		
+		extract_field_at_column(row1, cols1, idx1, str_val1, &int_val1, &len1);
+		extract_field_at_column(row2, cols2, idx2, str_val2, &int_val2, &len2);
+		
+		void *v1 = (cols1[idx1].col_type == T_INT) ? (void*)&int_val1 : (void*)str_val1;
+		void *v2 = (cols2[idx2].col_type == T_INT) ? (void*)&int_val2 : (void*)str_val2;
+		
+		if (!are_fields_equal(&cols1[idx1], len1, v1, len2, v2)) {
+			return false;
+		}
+	}
+	
+	return true;
+}
+
+/**
+ * Print a joined row with proper column ordering
+ */
+static void print_joined_row(unsigned char *row1, unsigned char *row2, tpd_entry *tpd1, tpd_entry *tpd2, int *common_map1, int *common_map2, int num_common)
+{
+	cd_entry *cols1 = (cd_entry*)((char*)tpd1 + tpd1->cd_offset);
+	cd_entry *cols2 = (cd_entry*)((char*)tpd2 + tpd2->cd_offset);
+	bool first = true;
+	
+	// Print common columns (from table1)
+	for (int c = 0; c < num_common; c++) {
+		int idx = common_map1[c];
+		unsigned char len;
+		unsigned char str_val[256] = {0};
+		int int_val = 0;
+		
+		extract_field_at_column(row1, cols1, idx, str_val, &int_val, &len);
+		
+		if (!first) printf(" | ");
+		void *v = (cols1[idx].col_type == T_INT) ? (void*)&int_val : (void*)str_val;
+		print_field(&cols1[idx], len, v);
+		first = false;
+	}
+	
+	// Print remaining columns from table1
+	for (int i = 0; i < tpd1->num_columns; i++) {
+		bool is_common = false;
+		for (int c = 0; c < num_common; c++) {
+			if (common_map1[c] == i) {
+				is_common = true;
+				break;
+			}
+		}
+		
+		if (!is_common) {
+			unsigned char len;
+			unsigned char str_val[256] = {0};
+			int int_val = 0;
+			
+			extract_field_at_column(row1, cols1, i, str_val, &int_val, &len);
+			
+			if (!first) printf(" | ");
+			void *v = (cols1[i].col_type == T_INT) ? (void*)&int_val : (void*)str_val;
+			print_field(&cols1[i], len, v);
+			first = false;
+		}
+	}
+	
+	// Print remaining columns from table2
+	for (int i = 0; i < tpd2->num_columns; i++) {
+		bool is_common = false;
+		for (int c = 0; c < num_common; c++) {
+			if (common_map2[c] == i) {
+				is_common = true;
+				break;
+			}
+		}
+		
+		if (!is_common) {
+			unsigned char len;
+			unsigned char str_val[256] = {0};
+			int int_val = 0;
+			
+			extract_field_at_column(row2, cols2, i, str_val, &int_val, &len);
+			
+			if (!first) printf(" | ");
+			void *v = (cols2[i].col_type == T_INT) ? (void*)&int_val : (void*)str_val;
+			print_field(&cols2[i], len, v);
+			first = false;
+		}
+	}
+	
+	printf("\n");
 }
 
 tpd_entry* get_tpd_from_list(char *tabname)
