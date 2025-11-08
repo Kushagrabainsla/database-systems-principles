@@ -13,12 +13,12 @@ db.h - This file contains all the structures, defines, and function
 
 
 typedef struct table_file_header_def {
-	int32_t file_size;
-	int32_t record_size;
-	int32_t num_records;
-	int32_t record_offset;
-	int32_t file_header_flag;
-	int64_t tpd_ptr; // MUST be 0 on disk
+	int file_size;
+	int record_size;
+	int num_records;
+	int record_offset;
+	int file_header_flag;
+	int tpd_ptr; // MUST be 0 on disk
 } table_file_header;
 
 /* Column descriptor sturcture = 20+4+4+4+4 = 36 bytes */

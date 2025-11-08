@@ -17,6 +17,319 @@
 #endif
 
 
+
+static int open_tab_rw(const char *table_name, FILE **pf, table_file_header *hdr)
+{
+	char fname[MAX_IDENT_LEN + 5] = {0};
+	snprintf(fname, sizeof(fname), "%s.tab", table_name);
+
+	*pf = fopen(fname, "rb+");         // read/write binary
+	if (!*pf) return FILE_OPEN_ERROR;
+
+	fseek(*pf, 0, SEEK_SET);
+	if (fread(hdr, sizeof(*hdr), 1, *pf) != 1) {
+		fclose(*pf); *pf = NULL;
+		return FILE_OPEN_ERROR;
+	}
+	return 0;
+}
+
+static int write_header(FILE *f, const table_file_header *hdr_in)
+{
+	table_file_header on_disk = *hdr_in;
+	on_disk.tpd_ptr = 0; // zero when writing
+	fseek(f, 0, SEEK_SET);
+	if (fwrite(&on_disk, sizeof(on_disk), 1, f) != 1) return FILE_WRITE_ERROR;
+	fflush(f);
+	return 0;
+}
+
+static long row_pos(const table_file_header *hdr, int row_idx)
+{
+  	return (long)hdr->record_offset + (long)row_idx * (long)hdr->record_size;
+}
+
+static inline int round4(int n) { return (n + 3) & ~3; }
+
+static int compute_record_size_from_tpd(const tpd_entry *tpd) {
+	int rec = 0;
+	const cd_entry *col = (const cd_entry*)((const char*)tpd + tpd->cd_offset);
+	for (int i = 0; i < tpd->num_columns; ++i, ++col) {
+		if (col->col_type == T_INT) rec += 1 + 4; // 1-byte length + 4
+		else rec += 1 + col->col_len; // CHAR/VARCHAR(n)
+	}
+	return round4(rec);
+}
+
+static int create_table_data_file(const tpd_entry *tpd) {
+	char fname[MAX_IDENT_LEN + 5] = {0};
+	snprintf(fname, sizeof(fname), "%s.tab", tpd->table_name);
+
+	int rec_size = compute_record_size_from_tpd(tpd);
+
+	table_file_header hdr = {0};
+	hdr.record_size    = rec_size;
+	hdr.num_records    = 0;
+	hdr.record_offset  = sizeof(table_file_header);
+	hdr.file_size      = hdr.record_offset + rec_size * MAX_ROWS;
+	hdr.file_header_flag = 0;
+	hdr.tpd_ptr        = 0; // zero on disk
+
+	char *zeros = (char*)calloc(1, hdr.file_size);
+	if (!zeros) return MEMORY_ERROR;
+	memcpy(zeros, &hdr, sizeof(hdr));
+
+	FILE *fh = fopen(fname, "wbc");
+	if (!fh) { free(zeros); return FILE_OPEN_ERROR; }
+	size_t wrote = fwrite(zeros, hdr.file_size, 1, fh);
+	fflush(fh);
+	fclose(fh);
+	free(zeros);
+	return (wrote == 1) ? 0 : FILE_WRITE_ERROR;
+}
+
+static int drop_table_data_file(const char *table_name) {
+	char fname[MAX_IDENT_LEN + 5] = {0};
+	snprintf(fname, sizeof(fname), "%s.tab", table_name);
+	if (remove(fname) == 0) return 0;
+	if (errno == ENOENT)    return 0;
+	return FILE_OPEN_ERROR;
+}
+
+
+/* Extract a field value from a row buffer at the specified column index */
+static void extract_field_at_column(unsigned char *row_buffer, cd_entry *columns, int col_index, unsigned char *str_value, int *int_value, unsigned char *length)
+{
+	int offset = 0;
+	
+	// Calculate offset to the target column
+	for (int i = 0; i < col_index; i++) {
+		offset += 1 + ((columns[i].col_type == T_INT) ? 4 : columns[i].col_len);
+	}
+	
+	// Read length byte
+	*length = row_buffer[offset++];
+	
+	// Read the actual value
+	if (columns[col_index].col_type == T_INT) {
+		if (*length > 0) {
+			memcpy(int_value, row_buffer + offset, 4);
+		} else {
+			*int_value = 0; // NULL
+		}
+	} else {
+		if (*length > 0) {
+			memcpy(str_value, row_buffer + offset, *length);
+		}
+	}
+}
+
+/* Compare two field values for equality */
+static bool are_fields_equal(cd_entry *col, unsigned char len1, void *val1, unsigned char len2, void *val2)
+{
+	// Both NULL
+	if (len1 == 0 && len2 == 0) return true;
+	
+	// One NULL, one not
+	if (len1 == 0 || len2 == 0) return false;
+	
+	// Compare based on type
+	if (col->col_type == T_INT) {
+		return *(int32_t*)val1 == *(int32_t*)val2;
+	} else {
+		return (len1 == len2) && (memcmp(val1, val2, len1) == 0);
+	}
+}
+
+/**
+ * Print a single field value
+ */
+static void print_field(cd_entry *col, unsigned char length, void *value)
+{
+	if (length == 0) {
+		printf("NULL");
+	} else if (col->col_type == T_INT) {
+		printf("%d", *(int32_t*)value);
+	} else {
+		printf("'%.*s'", (int)length, (char*)value);
+	}
+}
+
+/**
+ * Find common columns between two tables for NATURAL JOIN
+ */
+static int find_common_columns(tpd_entry *tpd1, tpd_entry *tpd2, int *col_map1, int *col_map2)
+{
+	cd_entry *cols1 = (cd_entry*)((char*)tpd1 + tpd1->cd_offset);
+	cd_entry *cols2 = (cd_entry*)((char*)tpd2 + tpd2->cd_offset);
+	int num_common = 0;
+	
+	for (int i = 0; i < tpd1->num_columns; i++) {
+		for (int j = 0; j < tpd2->num_columns; j++) {
+			if (strcmp(cols1[i].col_name, cols2[j].col_name) == 0) {
+				col_map1[num_common] = i;
+				col_map2[num_common] = j;
+				num_common++;
+				break;
+			}
+		}
+	}
+	
+	return num_common;
+}
+
+/**
+ * Print the header row for NATURAL JOIN result
+ * Format: common columns | remaining table1 columns | remaining table2 columns
+ */
+static void print_join_header(tpd_entry *tpd1, tpd_entry *tpd2,  int *common_map1, int *common_map2, int num_common)
+{
+	cd_entry *cols1 = (cd_entry*)((char*)tpd1 + tpd1->cd_offset);
+	cd_entry *cols2 = (cd_entry*)((char*)tpd2 + tpd2->cd_offset);
+	bool first = true;
+	
+	// Print common columns first
+	for (int i = 0; i < num_common; i++) {
+		if (!first) printf(" | ");
+		printf("%s", cols1[common_map1[i]].col_name);
+		first = false;
+	}
+	
+	// Print remaining columns from table1
+	for (int i = 0; i < tpd1->num_columns; i++) {
+		bool is_common = false;
+		for (int c = 0; c < num_common; c++) {
+			if (common_map1[c] == i) {
+				is_common = true;
+				break;
+			}
+		}
+		if (!is_common) {
+			if (!first) printf(" | ");
+			printf("%s", cols1[i].col_name);
+			first = false;
+		}
+	}
+	
+	// Print remaining columns from table2
+	for (int i = 0; i < tpd2->num_columns; i++) {
+		bool is_common = false;
+		for (int c = 0; c < num_common; c++) {
+			if (common_map2[c] == i) {
+				is_common = true;
+				break;
+			}
+		}
+		if (!is_common) {
+			if (!first) printf(" | ");
+			printf("%s", cols2[i].col_name);
+			first = false;
+		}
+	}
+	
+	printf("\n");
+}
+
+/* Check if two rows match on all common columns */
+static bool rows_match_on_common_columns(unsigned char *row1, unsigned char *row2, cd_entry *cols1, cd_entry *cols2, int *common_map1, int *common_map2, int num_common)
+{
+	for (int c = 0; c < num_common; c++) {
+		int idx1 = common_map1[c];
+		int idx2 = common_map2[c];
+		
+		unsigned char len1, len2;
+		unsigned char str_val1[256] = {0}, str_val2[256] = {0};
+		int int_val1 = 0, int_val2 = 0;
+		
+		extract_field_at_column(row1, cols1, idx1, str_val1, &int_val1, &len1);
+		extract_field_at_column(row2, cols2, idx2, str_val2, &int_val2, &len2);
+		
+		void *v1 = (cols1[idx1].col_type == T_INT) ? (void*)&int_val1 : (void*)str_val1;
+		void *v2 = (cols2[idx2].col_type == T_INT) ? (void*)&int_val2 : (void*)str_val2;
+		
+		if (!are_fields_equal(&cols1[idx1], len1, v1, len2, v2)) {
+			return false;
+		}
+	}
+	
+	return true;
+}
+
+/**
+ * Print a joined row with proper column ordering
+ */
+static void print_joined_row(unsigned char *row1, unsigned char *row2, tpd_entry *tpd1, tpd_entry *tpd2, int *common_map1, int *common_map2, int num_common)
+{
+	cd_entry *cols1 = (cd_entry*)((char*)tpd1 + tpd1->cd_offset);
+	cd_entry *cols2 = (cd_entry*)((char*)tpd2 + tpd2->cd_offset);
+	bool first = true;
+	
+	// Print common columns (from table1)
+	for (int c = 0; c < num_common; c++) {
+		int idx = common_map1[c];
+		unsigned char len;
+		unsigned char str_val[256] = {0};
+		int int_val = 0;
+		
+		extract_field_at_column(row1, cols1, idx, str_val, &int_val, &len);
+		
+		if (!first) printf(" | ");
+		void *v = (cols1[idx].col_type == T_INT) ? (void*)&int_val : (void*)str_val;
+		print_field(&cols1[idx], len, v);
+		first = false;
+	}
+	
+	// Print remaining columns from table1
+	for (int i = 0; i < tpd1->num_columns; i++) {
+		bool is_common = false;
+		for (int c = 0; c < num_common; c++) {
+			if (common_map1[c] == i) {
+				is_common = true;
+				break;
+			}
+		}
+		
+		if (!is_common) {
+			unsigned char len;
+			unsigned char str_val[256] = {0};
+			int int_val = 0;
+			
+			extract_field_at_column(row1, cols1, i, str_val, &int_val, &len);
+			
+			if (!first) printf(" | ");
+			void *v = (cols1[i].col_type == T_INT) ? (void*)&int_val : (void*)str_val;
+			print_field(&cols1[i], len, v);
+			first = false;
+		}
+	}
+	
+	// Print remaining columns from table2
+	for (int i = 0; i < tpd2->num_columns; i++) {
+		bool is_common = false;
+		for (int c = 0; c < num_common; c++) {
+			if (common_map2[c] == i) {
+				is_common = true;
+				break;
+			}
+		}
+		
+		if (!is_common) {
+			unsigned char len;
+			unsigned char str_val[256] = {0};
+			int int_val = 0;
+			
+			extract_field_at_column(row2, cols2, i, str_val, &int_val, &len);
+			
+			if (!first) printf(" | ");
+			void *v = (cols2[i].col_type == T_INT) ? (void*)&int_val : (void*)str_val;
+			print_field(&cols2[i], len, v);
+			first = false;
+		}
+	}
+	
+	printf("\n");
+}
+
 int main(int argc, char** argv)
 {
 	int rc = 0;
@@ -1394,318 +1707,6 @@ int drop_tpd_from_list(char *tabname)
 	}
 
 	return rc;
-}
-
-static int open_tab_rw(const char *table_name, FILE **pf, table_file_header *hdr)
-{
-	char fname[MAX_IDENT_LEN + 5] = {0};
-	snprintf(fname, sizeof(fname), "%s.tab", table_name);
-
-	*pf = fopen(fname, "rb+");         // read/write binary
-	if (!*pf) return FILE_OPEN_ERROR;
-
-	fseek(*pf, 0, SEEK_SET);
-	if (fread(hdr, sizeof(*hdr), 1, *pf) != 1) {
-		fclose(*pf); *pf = NULL;
-		return FILE_OPEN_ERROR;
-	}
-	return 0;
-}
-
-static int write_header(FILE *f, const table_file_header *hdr_in)
-{
-	table_file_header on_disk = *hdr_in;
-	on_disk.tpd_ptr = 0; // zero when writing
-	fseek(f, 0, SEEK_SET);
-	if (fwrite(&on_disk, sizeof(on_disk), 1, f) != 1) return FILE_WRITE_ERROR;
-	fflush(f);
-	return 0;
-}
-
-static long row_pos(const table_file_header *hdr, int row_idx)
-{
-  	return (long)hdr->record_offset + (long)row_idx * (long)hdr->record_size;
-}
-
-static inline int round4(int n) { return (n + 3) & ~3; }
-
-static int compute_record_size_from_tpd(const tpd_entry *tpd) {
-	int rec = 0;
-	const cd_entry *col = (const cd_entry*)((const char*)tpd + tpd->cd_offset);
-	for (int i = 0; i < tpd->num_columns; ++i, ++col) {
-		if (col->col_type == T_INT) rec += 1 + 4; // 1-byte length + 4
-		else rec += 1 + col->col_len; // CHAR/VARCHAR(n)
-	}
-	return round4(rec);
-}
-
-static int create_table_data_file(const tpd_entry *tpd) {
-	char fname[MAX_IDENT_LEN + 5] = {0};
-	snprintf(fname, sizeof(fname), "%s.tab", tpd->table_name);
-
-	int rec_size = compute_record_size_from_tpd(tpd);
-
-	table_file_header hdr = {0};
-	hdr.record_size    = rec_size;
-	hdr.num_records    = 0;
-	hdr.record_offset  = sizeof(table_file_header);
-	hdr.file_size      = hdr.record_offset + rec_size * MAX_ROWS;
-	hdr.file_header_flag = 0;
-	hdr.tpd_ptr        = 0; // zero on disk
-
-	char *zeros = (char*)calloc(1, hdr.file_size);
-	if (!zeros) return MEMORY_ERROR;
-	memcpy(zeros, &hdr, sizeof(hdr));
-
-	FILE *fh = fopen(fname, "wbc");
-	if (!fh) { free(zeros); return FILE_OPEN_ERROR; }
-	size_t wrote = fwrite(zeros, hdr.file_size, 1, fh);
-	fflush(fh);
-	fclose(fh);
-	free(zeros);
-	return (wrote == 1) ? 0 : FILE_WRITE_ERROR;
-}
-
-static int drop_table_data_file(const char *table_name) {
-	char fname[MAX_IDENT_LEN + 5] = {0};
-	snprintf(fname, sizeof(fname), "%s.tab", table_name);
-	if (remove(fname) == 0) return 0;
-	if (errno == ENOENT)    return 0;
-	return FILE_OPEN_ERROR;
-}
-
-
-/* Extract a field value from a row buffer at the specified column index */
-static void extract_field_at_column(unsigned char *row_buffer, cd_entry *columns, int col_index, unsigned char *str_value, int *int_value, unsigned char *length)
-{
-	int offset = 0;
-	
-	// Calculate offset to the target column
-	for (int i = 0; i < col_index; i++) {
-		offset += 1 + ((columns[i].col_type == T_INT) ? 4 : columns[i].col_len);
-	}
-	
-	// Read length byte
-	*length = row_buffer[offset++];
-	
-	// Read the actual value
-	if (columns[col_index].col_type == T_INT) {
-		if (*length > 0) {
-			memcpy(int_value, row_buffer + offset, 4);
-		} else {
-			*int_value = 0; // NULL
-		}
-	} else {
-		if (*length > 0) {
-			memcpy(str_value, row_buffer + offset, *length);
-		}
-	}
-}
-
-/* Compare two field values for equality */
-static bool are_fields_equal(cd_entry *col, unsigned char len1, void *val1, unsigned char len2, void *val2)
-{
-	// Both NULL
-	if (len1 == 0 && len2 == 0) return true;
-	
-	// One NULL, one not
-	if (len1 == 0 || len2 == 0) return false;
-	
-	// Compare based on type
-	if (col->col_type == T_INT) {
-		return *(int32_t*)val1 == *(int32_t*)val2;
-	} else {
-		return (len1 == len2) && (memcmp(val1, val2, len1) == 0);
-	}
-}
-
-/**
- * Print a single field value
- */
-static void print_field(cd_entry *col, unsigned char length, void *value)
-{
-	if (length == 0) {
-		printf("NULL");
-	} else if (col->col_type == T_INT) {
-		printf("%d", *(int32_t*)value);
-	} else {
-		printf("'%.*s'", (int)length, (char*)value);
-	}
-}
-
-/**
- * Find common columns between two tables for NATURAL JOIN
- */
-static int find_common_columns(tpd_entry *tpd1, tpd_entry *tpd2, int *col_map1, int *col_map2)
-{
-	cd_entry *cols1 = (cd_entry*)((char*)tpd1 + tpd1->cd_offset);
-	cd_entry *cols2 = (cd_entry*)((char*)tpd2 + tpd2->cd_offset);
-	int num_common = 0;
-	
-	for (int i = 0; i < tpd1->num_columns; i++) {
-		for (int j = 0; j < tpd2->num_columns; j++) {
-			if (strcmp(cols1[i].col_name, cols2[j].col_name) == 0) {
-				col_map1[num_common] = i;
-				col_map2[num_common] = j;
-				num_common++;
-				break;
-			}
-		}
-	}
-	
-	return num_common;
-}
-
-/**
- * Print the header row for NATURAL JOIN result
- * Format: common columns | remaining table1 columns | remaining table2 columns
- */
-static void print_join_header(tpd_entry *tpd1, tpd_entry *tpd2,  int *common_map1, int *common_map2, int num_common)
-{
-	cd_entry *cols1 = (cd_entry*)((char*)tpd1 + tpd1->cd_offset);
-	cd_entry *cols2 = (cd_entry*)((char*)tpd2 + tpd2->cd_offset);
-	bool first = true;
-	
-	// Print common columns first
-	for (int i = 0; i < num_common; i++) {
-		if (!first) printf(" | ");
-		printf("%s", cols1[common_map1[i]].col_name);
-		first = false;
-	}
-	
-	// Print remaining columns from table1
-	for (int i = 0; i < tpd1->num_columns; i++) {
-		bool is_common = false;
-		for (int c = 0; c < num_common; c++) {
-			if (common_map1[c] == i) {
-				is_common = true;
-				break;
-			}
-		}
-		if (!is_common) {
-			if (!first) printf(" | ");
-			printf("%s", cols1[i].col_name);
-			first = false;
-		}
-	}
-	
-	// Print remaining columns from table2
-	for (int i = 0; i < tpd2->num_columns; i++) {
-		bool is_common = false;
-		for (int c = 0; c < num_common; c++) {
-			if (common_map2[c] == i) {
-				is_common = true;
-				break;
-			}
-		}
-		if (!is_common) {
-			if (!first) printf(" | ");
-			printf("%s", cols2[i].col_name);
-			first = false;
-		}
-	}
-	
-	printf("\n");
-}
-
-/* Check if two rows match on all common columns */
-static bool rows_match_on_common_columns(unsigned char *row1, unsigned char *row2, cd_entry *cols1, cd_entry *cols2, int *common_map1, int *common_map2, int num_common)
-{
-	for (int c = 0; c < num_common; c++) {
-		int idx1 = common_map1[c];
-		int idx2 = common_map2[c];
-		
-		unsigned char len1, len2;
-		unsigned char str_val1[256] = {0}, str_val2[256] = {0};
-		int int_val1 = 0, int_val2 = 0;
-		
-		extract_field_at_column(row1, cols1, idx1, str_val1, &int_val1, &len1);
-		extract_field_at_column(row2, cols2, idx2, str_val2, &int_val2, &len2);
-		
-		void *v1 = (cols1[idx1].col_type == T_INT) ? (void*)&int_val1 : (void*)str_val1;
-		void *v2 = (cols2[idx2].col_type == T_INT) ? (void*)&int_val2 : (void*)str_val2;
-		
-		if (!are_fields_equal(&cols1[idx1], len1, v1, len2, v2)) {
-			return false;
-		}
-	}
-	
-	return true;
-}
-
-/**
- * Print a joined row with proper column ordering
- */
-static void print_joined_row(unsigned char *row1, unsigned char *row2, tpd_entry *tpd1, tpd_entry *tpd2, int *common_map1, int *common_map2, int num_common)
-{
-	cd_entry *cols1 = (cd_entry*)((char*)tpd1 + tpd1->cd_offset);
-	cd_entry *cols2 = (cd_entry*)((char*)tpd2 + tpd2->cd_offset);
-	bool first = true;
-	
-	// Print common columns (from table1)
-	for (int c = 0; c < num_common; c++) {
-		int idx = common_map1[c];
-		unsigned char len;
-		unsigned char str_val[256] = {0};
-		int int_val = 0;
-		
-		extract_field_at_column(row1, cols1, idx, str_val, &int_val, &len);
-		
-		if (!first) printf(" | ");
-		void *v = (cols1[idx].col_type == T_INT) ? (void*)&int_val : (void*)str_val;
-		print_field(&cols1[idx], len, v);
-		first = false;
-	}
-	
-	// Print remaining columns from table1
-	for (int i = 0; i < tpd1->num_columns; i++) {
-		bool is_common = false;
-		for (int c = 0; c < num_common; c++) {
-			if (common_map1[c] == i) {
-				is_common = true;
-				break;
-			}
-		}
-		
-		if (!is_common) {
-			unsigned char len;
-			unsigned char str_val[256] = {0};
-			int int_val = 0;
-			
-			extract_field_at_column(row1, cols1, i, str_val, &int_val, &len);
-			
-			if (!first) printf(" | ");
-			void *v = (cols1[i].col_type == T_INT) ? (void*)&int_val : (void*)str_val;
-			print_field(&cols1[i], len, v);
-			first = false;
-		}
-	}
-	
-	// Print remaining columns from table2
-	for (int i = 0; i < tpd2->num_columns; i++) {
-		bool is_common = false;
-		for (int c = 0; c < num_common; c++) {
-			if (common_map2[c] == i) {
-				is_common = true;
-				break;
-			}
-		}
-		
-		if (!is_common) {
-			unsigned char len;
-			unsigned char str_val[256] = {0};
-			int int_val = 0;
-			
-			extract_field_at_column(row2, cols2, i, str_val, &int_val, &len);
-			
-			if (!first) printf(" | ");
-			void *v = (cols2[i].col_type == T_INT) ? (void*)&int_val : (void*)str_val;
-			print_field(&cols2[i], len, v);
-			first = false;
-		}
-	}
-	
-	printf("\n");
 }
 
 tpd_entry* get_tpd_from_list(char *tabname)
