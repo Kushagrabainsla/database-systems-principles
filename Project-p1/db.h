@@ -2,6 +2,7 @@
 db.h - This file contains all the structures, defines, and function
 	prototype for the db.exe program.
 *********************************************************************/
+#include <stdint.h>
 
 #define MAX_IDENT_LEN   16
 #define MAX_NUM_COL			16
@@ -13,12 +14,12 @@ db.h - This file contains all the structures, defines, and function
 
 
 typedef struct table_file_header_def {
-	int file_size;
-	int record_size;
-	int num_records;
-	int record_offset;
-	int file_header_flag;
-	int tpd_ptr; // MUST be 0 on disk
+	int32_t file_size;        // 4 bytes
+	int32_t record_size;      // 4 bytes
+	int32_t num_records;      // 4 bytes
+	int32_t record_offset;    // 4 bytes
+	int32_t file_header_flag; // 4 bytes
+	int64_t tpd_ptr;          // 8 bytes (MUST be 0 on disk)
 } table_file_header;
 
 /* Column descriptor sturcture = 20+4+4+4+4 = 36 bytes */
