@@ -18,6 +18,12 @@
 
 
 
+/* Globals to store output column ordering/widths for JOIN printing */
+static int join_out_count = 0;
+static int join_out_widths[MAX_NUM_COL * 2];
+static int join_out_types[MAX_NUM_COL * 2];
+static char join_out_names[MAX_NUM_COL * 2][MAX_IDENT_LEN+8];
+
 static int open_tab_rw(const char *table_name, FILE **pf, table_file_header *hdr)
 {
 	char fname[MAX_IDENT_LEN + 5] = {0};
@@ -38,6 +44,10 @@ static int write_header(FILE *f, const table_file_header *hdr_in)
 {
 	table_file_header on_disk = *hdr_in;
 	on_disk.tpd_ptr = 0; // zero when writing
+
+	/* Recompute on-disk file_size to reflect actual number of records */
+	on_disk.file_size = on_disk.record_offset + on_disk.record_size * on_disk.num_records;
+
 	fseek(f, 0, SEEK_SET);
 	if (fwrite(&on_disk, sizeof(on_disk), 1, f) != 1) return FILE_WRITE_ERROR;
 	fflush(f);
@@ -71,21 +81,18 @@ static int create_table_data_file(const tpd_entry *tpd) {
 	hdr.record_size    = rec_size;
 	hdr.num_records    = 0;
 	hdr.record_offset  = sizeof(table_file_header);
-	hdr.file_size      = hdr.record_offset + rec_size * MAX_ROWS;
+	/* Initially only write the header; do not pre-allocate space for MAX_ROWS */
+	hdr.file_size      = hdr.record_offset; 
 	hdr.file_header_flag = 0;
 	hdr.tpd_ptr        = 0; // zero on disk
 
-	char *zeros = (char*)calloc(1, hdr.file_size);
-	if (!zeros) return MEMORY_ERROR;
-	memcpy(zeros, &hdr, sizeof(hdr));
-
-	FILE *fh = fopen(fname, "wbc");
-	if (!fh) { free(zeros); return FILE_OPEN_ERROR; }
-	size_t wrote = fwrite(zeros, hdr.file_size, 1, fh);
+	/* Write only the header to create a small initial file. File will grow as records are inserted. */
+	FILE *fh = fopen(fname, "wb");
+	if (!fh) return FILE_OPEN_ERROR;
+	if (fwrite(&hdr, sizeof(hdr), 1, fh) != 1) { fclose(fh); return FILE_WRITE_ERROR; }
 	fflush(fh);
 	fclose(fh);
-	free(zeros);
-	return (wrote == 1) ? 0 : FILE_WRITE_ERROR;
+	return 0;
 }
 
 static int drop_table_data_file(const char *table_name) {
@@ -151,7 +158,8 @@ static void print_field(cd_entry *col, unsigned char length, void *value)
 	} else if (col->col_type == T_INT) {
 		printf("%d", *(int32_t*)value);
 	} else {
-		printf("'%.*s'", (int)length, (char*)value);
+		/* Print strings without surrounding quotes */
+		printf("%.*s", (int)length, (char*)value);
 	}
 }
 
@@ -187,14 +195,33 @@ static void print_join_header(tpd_entry *tpd1, tpd_entry *tpd2,  int *common_map
 	cd_entry *cols1 = (cd_entry*)((char*)tpd1 + tpd1->cd_offset);
 	cd_entry *cols2 = (cd_entry*)((char*)tpd2 + tpd2->cd_offset);
 	bool first = true;
-	
-	// Print common columns first
+
+	/* We'll build an ordered list of output columns and compute widths */
+	int out_col_count = 0;
+	static int out_col_widths[MAX_NUM_COL * 2];
+	static int out_col_types[MAX_NUM_COL * 2];
+	static char out_col_names[MAX_NUM_COL * 2][MAX_IDENT_LEN+8];
+
+	// helper to add a column to output list
+	auto add_out_col = [&](const char *name, int col_type, int col_len) {
+		strncpy(out_col_names[out_col_count], name, sizeof(out_col_names[0]) - 1);
+		out_col_names[out_col_count][sizeof(out_col_names[0]) - 1] = '\0';
+		out_col_types[out_col_count] = col_type;
+		int w = (int)strlen(name);
+		if (col_type == T_INT) {
+			if (w < 5) w = 5; // width for ints
+		} else {
+			if (w < col_len) w = col_len;
+		}
+		out_col_widths[out_col_count] = w;
+		out_col_count++;
+	};
+
+	// Print common columns first (and add to out list)
 	for (int i = 0; i < num_common; i++) {
-		if (!first) printf(" | ");
-		printf("%s", cols1[common_map1[i]].col_name);
-		first = false;
+		add_out_col(cols1[common_map1[i]].col_name, cols1[common_map1[i]].col_type, cols1[common_map1[i]].col_len);
 	}
-	
+
 	// Print remaining columns from table1
 	for (int i = 0; i < tpd1->num_columns; i++) {
 		bool is_common = false;
@@ -205,8 +232,7 @@ static void print_join_header(tpd_entry *tpd1, tpd_entry *tpd2,  int *common_map
 			}
 		}
 		if (!is_common) {
-			if (!first) printf(" | ");
-			printf("%s", cols1[i].col_name);
+			add_out_col(cols1[i].col_name, cols1[i].col_type, cols1[i].col_len);
 			first = false;
 		}
 	}
@@ -221,13 +247,35 @@ static void print_join_header(tpd_entry *tpd1, tpd_entry *tpd2,  int *common_map
 			}
 		}
 		if (!is_common) {
-			if (!first) printf(" | ");
-			printf("%s", cols2[i].col_name);
+			add_out_col(cols2[i].col_name, cols2[i].col_type, cols2[i].col_len);
 			first = false;
 		}
 	}
-	
+    
+	/* Print header row with computed widths */
+	for (int i = 0; i < out_col_count; ++i) {
+		printf("%-*s", out_col_widths[i], out_col_names[i]);
+		if (i + 1 < out_col_count) printf(" ");
+	}
 	printf("\n");
+
+	/* Print separator line */
+	for (int i = 0; i < out_col_count; ++i) {
+		for (int j = 0; j < out_col_widths[i]; ++j) putchar('-');
+		if (i + 1 < out_col_count) putchar(' ');
+	}
+	printf("\n");
+
+	/* Store generated widths and counts in static globals for use by print_joined_row */
+	/* We'll copy into static arrays accessible by print_joined_row */
+	/* Copy into file-scoped join_out_* arrays so print_joined_row can use them */
+	join_out_count = out_col_count;
+	for (int i = 0; i < out_col_count; ++i) {
+		join_out_widths[i] = out_col_widths[i];
+		join_out_types[i] = out_col_types[i];
+		strncpy(join_out_names[i], out_col_names[i], sizeof(join_out_names[0]) - 1);
+		join_out_names[i][sizeof(join_out_names[0]) - 1] = '\0';
+	}
 }
 
 /* Check if two rows match on all common columns */
@@ -262,71 +310,75 @@ static void print_joined_row(unsigned char *row1, unsigned char *row2, tpd_entry
 {
 	cd_entry *cols1 = (cd_entry*)((char*)tpd1 + tpd1->cd_offset);
 	cd_entry *cols2 = (cd_entry*)((char*)tpd2 + tpd2->cd_offset);
-	bool first = true;
-	
-	// Print common columns (from table1)
+	int pos = 0;
+
+	/* Print common columns (from table1) */
 	for (int c = 0; c < num_common; c++) {
 		int idx = common_map1[c];
 		unsigned char len;
 		unsigned char str_val[256] = {0};
 		int int_val = 0;
-		
 		extract_field_at_column(row1, cols1, idx, str_val, &int_val, &len);
-		
-		if (!first) printf(" | ");
-		void *v = (cols1[idx].col_type == T_INT) ? (void*)&int_val : (void*)str_val;
-		print_field(&cols1[idx], len, v);
-		first = false;
+
+		if (join_out_types[pos] == T_INT) {
+			if (len == 0) printf("%-*s", join_out_widths[pos], "NULL");
+			else printf("%*d", join_out_widths[pos], int_val);
+		} else {
+			if (len == 0) printf("%-*s", join_out_widths[pos], "NULL");
+			else printf("%-*.*s", join_out_widths[pos], (int)len, (char*)str_val);
+		}
+		if (pos + 1 < join_out_count) printf(" ");
+		pos++;
 	}
-	
-	// Print remaining columns from table1
+
+	/* Remaining columns from table1 */
 	for (int i = 0; i < tpd1->num_columns; i++) {
 		bool is_common = false;
 		for (int c = 0; c < num_common; c++) {
-			if (common_map1[c] == i) {
-				is_common = true;
-				break;
-			}
+			if (common_map1[c] == i) { is_common = true; break; }
 		}
-		
 		if (!is_common) {
 			unsigned char len;
 			unsigned char str_val[256] = {0};
 			int int_val = 0;
-			
 			extract_field_at_column(row1, cols1, i, str_val, &int_val, &len);
-			
-			if (!first) printf(" | ");
-			void *v = (cols1[i].col_type == T_INT) ? (void*)&int_val : (void*)str_val;
-			print_field(&cols1[i], len, v);
-			first = false;
+
+			if (join_out_types[pos] == T_INT) {
+				if (len == 0) printf("%-*s", join_out_widths[pos], "NULL");
+				else printf("%*d", join_out_widths[pos], int_val);
+			} else {
+				if (len == 0) printf("%-*s", join_out_widths[pos], "NULL");
+				else printf("%-*.*s", join_out_widths[pos], (int)len, (char*)str_val);
+			}
+			if (pos + 1 < join_out_count) printf(" ");
+			pos++;
 		}
 	}
-	
-	// Print remaining columns from table2
+
+	/* Remaining columns from table2 */
 	for (int i = 0; i < tpd2->num_columns; i++) {
 		bool is_common = false;
 		for (int c = 0; c < num_common; c++) {
-			if (common_map2[c] == i) {
-				is_common = true;
-				break;
-			}
+			if (common_map2[c] == i) { is_common = true; break; }
 		}
-		
 		if (!is_common) {
 			unsigned char len;
 			unsigned char str_val[256] = {0};
 			int int_val = 0;
-			
 			extract_field_at_column(row2, cols2, i, str_val, &int_val, &len);
-			
-			if (!first) printf(" | ");
-			void *v = (cols2[i].col_type == T_INT) ? (void*)&int_val : (void*)str_val;
-			print_field(&cols2[i], len, v);
-			first = false;
+
+			if (join_out_types[pos] == T_INT) {
+				if (len == 0) printf("%-*s", join_out_widths[pos], "NULL");
+				else printf("%*d", join_out_widths[pos], int_val);
+			} else {
+				if (len == 0) printf("%-*s", join_out_widths[pos], "NULL");
+				else printf("%-*.*s", join_out_widths[pos], (int)len, (char*)str_val);
+			}
+			if (pos + 1 < join_out_count) printf(" ");
+			pos++;
 		}
 	}
-	
+
 	printf("\n");
 }
 
@@ -1379,37 +1431,67 @@ int sem_select_star(token_list *t_list)
 		if ((rc = open_tab_rw(table_name, &table_file, &file_header))) return rc;
 
 		cd_entry *column_descriptors = (cd_entry*)((char*)table_descriptor + table_descriptor->cd_offset);
-		// header row
-		for (int column_index = 0; column_index < table_descriptor->num_columns; column_index++)
-			printf("%s%s", column_descriptors[column_index].col_name, (column_index + 1 < table_descriptor->num_columns) ? " | " : "\n");
+
+		/* Compute column widths based on column definitions and names */
+		int col_count = table_descriptor->num_columns;
+		int widths[MAX_NUM_COL] = {0};
+		for (int i = 0; i < col_count; ++i) {
+			int w = (int)strlen(column_descriptors[i].col_name);
+			if (column_descriptors[i].col_type == T_INT) {
+				if (w < 5) w = 5;
+			} else {
+				if (w < column_descriptors[i].col_len) w = column_descriptors[i].col_len;
+			}
+			widths[i] = w;
+		}
+
+		/* Print header */
+		for (int i = 0; i < col_count; ++i) {
+			printf("%-*s", widths[i], column_descriptors[i].col_name);
+			if (i + 1 < col_count) printf(" ");
+		}
+		printf("\n");
+		for (int i = 0; i < col_count; ++i) {
+			for (int j = 0; j < widths[i]; ++j) putchar('-');
+			if (i + 1 < col_count) putchar(' ');
+		}
+		printf("\n");
 
 		int record_size = file_header.record_size;
 		unsigned char *row_buffer = (unsigned char*)malloc(record_size);
 		if (!row_buffer) { fclose(table_file); return MEMORY_ERROR; }
+
+		/* Count of printed records */
+		int selected = 0;
 
 		for (int row_index = 0; row_index < file_header.num_records; ++row_index) {
 			fseek(table_file, row_pos(&file_header, row_index), SEEK_SET);
 			if (fread(row_buffer, record_size, 1, table_file) != 1) { rc = FILE_OPEN_ERROR; break; }
 
 			int buffer_offset = 0;
-			for (int column_index = 0; column_index < table_descriptor->num_columns; column_index++) {
+			for (int column_index = 0; column_index < col_count; column_index++) {
 				unsigned char field_length = row_buffer[buffer_offset++];
 
 				if (column_descriptors[column_index].col_type == T_INT) {
-					if (field_length == 0) printf("NULL");
-					else { int32_t int_value = 0; memcpy(&int_value, row_buffer + buffer_offset, 4); printf("%d", int_value); }
+					if (field_length == 0) printf("%-*s", widths[column_index], "NULL");
+					else { int32_t int_value = 0; memcpy(&int_value, row_buffer + buffer_offset, 4); printf("%*d", widths[column_index], int_value); }
 					buffer_offset += 4;
 				} else {
-					if (field_length == 0) printf("NULL");
-					else printf("'%.*s'", (int)field_length, (char*)(row_buffer + buffer_offset));
+					if (field_length == 0) printf("%-*s", widths[column_index], "NULL");
+					else printf("%-*.*s", widths[column_index], (int)field_length, (char*)(row_buffer + buffer_offset));
 					buffer_offset += column_descriptors[column_index].col_len;
 				}
-				printf("%s", (column_index + 1 < table_descriptor->num_columns) ? " | " : "\n");
+				if (column_index + 1 < col_count) printf(" "); else printf("\n");
 			}
+			/* Count this printed record */
+			selected++;
 		}
 
 		free(row_buffer);
 		fclose(table_file);
+
+		/* Print count summary similar to professor output */
+		printf("\n %d record(s) selected.\n\n", selected);
 		
 	} else {
 		// NATURAL JOIN logic
@@ -1461,6 +1543,9 @@ int sem_select_natural_join(tpd_entry *tpd1, tpd_entry *tpd2, const char *table_
 	
 	// Print header row
 	print_join_header(tpd1, tpd2, common_map1, common_map2, num_common);
+
+	/* Keep a count of printed joined rows */
+	int selected = 0;
 	
 	// Perform nested loop join
 	cd_entry *cols1 = (cd_entry*)((char*)tpd1 + tpd1->cd_offset);
@@ -1481,12 +1566,13 @@ int sem_select_natural_join(tpd_entry *tpd1, tpd_entry *tpd2, const char *table_
 			}
 			
 			// Check if rows match on common columns
-			if (rows_match_on_common_columns(
+				if (rows_match_on_common_columns(
 				row_buffer1, row_buffer2, 
 			    cols1, cols2,
 			    common_map1, common_map2, num_common
 			)) {
-				print_joined_row(row_buffer1, row_buffer2, tpd1, tpd2, common_map1, common_map2, num_common);
+					print_joined_row(row_buffer1, row_buffer2, tpd1, tpd2, common_map1, common_map2, num_common);
+					selected++;
 			}
 		}
 		
@@ -1498,7 +1584,10 @@ int sem_select_natural_join(tpd_entry *tpd1, tpd_entry *tpd2, const char *table_
 	free(row_buffer2);
 	fclose(file1);
 	fclose(file2);
-	
+
+	/* Print count summary for NATURAL JOIN */
+	printf("\n %d record(s) selected.\n\n", selected);
+
 	return rc;
 }
 
