@@ -456,14 +456,19 @@ int main(int argc, char **argv) {
     }
 
     if (rc) {
+      bool found_error = false;
       tok_ptr = tok_list;
       while (tok_ptr != NULL) {
         if ((tok_ptr->tok_class == error) || (tok_ptr->tok_value == INVALID)) {
           printf("\nError in the string: %s\n", tok_ptr->tok_string);
           printf("rc=%d\n", rc);
+          found_error = true;
           break;
         }
         tok_ptr = tok_ptr->next;
+      }
+      if (!found_error) {
+        printf("\nError: rc=%d\n", rc);
       }
     }
 
@@ -737,6 +742,12 @@ int do_semantic(token_list *tok_list) {
       break;
     case INSERT:
       rc = sem_insert_into(cur);
+      break;
+    case DELETE:
+      rc = sem_delete(cur);
+      break;
+    case UPDATE:
+      rc = sem_update(cur);
       break;
     case SELECT:
       rc = sem_select(cur);
@@ -1722,16 +1733,7 @@ int sem_update(token_list *t_list) {
             }
             offset += 4;
           } else {
-            if (len != 0 && where_value_type == STRING_LITERAL) {
-              int cmp =
-                  strncmp((char *)(row_buffer + offset), where_value_str, len);
-              if (where_operator == S_EQUAL)
-                match = (cmp == 0 && len == strlen(where_value_str));
-              else if (where_operator == S_LESS)
-                match = (cmp < 0);
-              else if (where_operator == S_GREATER)
-                match = (cmp > 0);
-            }
+            // ...
             offset += columns[col].col_len;
           }
           update_row = match;
@@ -2472,8 +2474,7 @@ int sem_select(token_list *t_list) {
     } else if (agg_type == F_COUNT) {
       printf("COUNT(%s)\n", agg_col);
       printf("----------\n");
-      printf("%d\n",
-             result_count); // Actually result_count is the filtered count
+      // result_count is the filtered count
       // Wait, count(col) should only count non-nulls.
       // My loop above handles non-null check for count(col).
       // For count(*), it's just result_count.
