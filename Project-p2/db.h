@@ -63,6 +63,27 @@ typedef struct t_list {
   struct t_list *next;
 } token_list;
 
+/* Helper structure for SELECT statement aggregate functions */
+typedef struct aggregate_func_def {
+  int type;                          // F_SUM, F_AVG, F_COUNT
+  char col_name[MAX_IDENT_LEN + 1];  // Column name or "*" for COUNT(*)
+} aggregate_func;
+
+/* Helper structure for SELECT statement column selection */
+typedef struct select_column_def {
+  char name[MAX_IDENT_LEN + 1];
+} select_column;
+
+/* Helper structure for WHERE clause conditions */
+typedef struct query_condition_def {
+  char col_name[MAX_IDENT_LEN + 1];
+  int operator_type;     // S_EQUAL, S_LESS, S_GREATER, K_IS
+  int value_type;        // INT_LITERAL, STRING_LITERAL, K_NULL, K_NOT
+  int int_value;
+  char str_value[256];
+  int logical_operator;  // K_AND, K_OR, or 0 for last condition
+} query_condition;
+
 /* This enum defines the different classes of tokens for
          semantic processing. */
 typedef enum t_class {

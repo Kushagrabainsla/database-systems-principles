@@ -1733,7 +1733,19 @@ int sem_update(token_list *t_list) {
             }
             offset += 4;
           } else {
-            // ...
+            // String comparison
+            if (len > 0 && where_value_type == STRING_LITERAL) {
+              char row_str[256] = {0};
+              memcpy(row_str, row_buffer + offset, len);
+              row_str[len] = '\0';
+              int cmp = strcmp(row_str, where_value_str);
+              if (where_operator == S_EQUAL)
+                match = (cmp == 0);
+              else if (where_operator == S_LESS)
+                match = (cmp < 0);
+              else if (where_operator == S_GREATER)
+                match = (cmp > 0);
+            }
             offset += columns[col].col_len;
           }
           update_row = match;
@@ -1814,61 +1826,94 @@ int sem_update(token_list *t_list) {
 int sem_select(token_list *t_list) {
   int rc = 0;
   token_list *cur = t_list;
-  // cur = cur->next; // Skip K_SELECT - Already skipped in do_semantic
-
-  // 1. Parse Select List
+  
+  // Query state variables
   bool is_star = false;
   bool is_aggregate = false;
-  int agg_type = 0; // F_SUM, F_AVG, F_COUNT
-  char agg_col[MAX_IDENT_LEN + 1] = {0};
-  char sel_cols[MAX_NUM_COL][MAX_IDENT_LEN + 1];
+  aggregate_func agg_funcs[MAX_NUM_COL];
+  int num_agg_funcs = 0;
+  select_column sel_cols[MAX_NUM_COL];
   int num_sel_cols = 0;
 
+  // 1. Parse SELECT list (star, aggregates, or column list)
   if (cur->tok_value == S_STAR) {
     is_star = true;
     cur = cur->next;
   } else if (cur->tok_class == function_name) {
+    // Parse one or more aggregate functions (e.g., SUM(x), AVG(y))
     is_aggregate = true;
-    agg_type = cur->tok_value;
-    cur = cur->next;
-    if (cur->tok_value != S_LEFT_PAREN) {
-      return INVALID_SELECT_DEFINITION;
-    }
-    cur = cur->next;
-    if (cur->tok_value == S_STAR) {
-      if (agg_type != F_COUNT) {
-        return INVALID_SELECT_DEFINITION; // * only valid for COUNT
+    
+    do {
+      if (cur->tok_class != function_name) {
+        return INVALID_SELECT_DEFINITION;
       }
-      strcpy(agg_col, "*");
+      
+      int func_type = cur->tok_value;
       cur = cur->next;
-    } else if ((cur->tok_class == keyword) || (cur->tok_class == identifier) ||
-               (cur->tok_class == type_name)) {
-      strcpy(agg_col, cur->tok_string);
+      
+      // Expect opening parenthesis
+      if (cur->tok_value != S_LEFT_PAREN) {
+        return INVALID_SELECT_DEFINITION;
+      }
       cur = cur->next;
-    } else {
-      return INVALID_SELECT_DEFINITION;
-    }
-    if (cur->tok_value != S_RIGHT_PAREN) {
-      return INVALID_SELECT_DEFINITION;
-    }
-    cur = cur->next;
-  } else {
-    // List of columns
-    while (true) {
-      if ((cur->tok_class == keyword) || (cur->tok_class == identifier) ||
-          (cur->tok_class == type_name)) {
-        strcpy(sel_cols[num_sel_cols++], cur->tok_string);
-        cur = cur->next;
-        if (cur->tok_value == S_COMMA) {
-          cur = cur->next;
-          continue;
-        } else {
-          break;
+      
+      // Parse aggregate parameter (column name or *)
+      char param_name[MAX_IDENT_LEN + 1] = {0};
+      if (cur->tok_value == S_STAR) {
+        if (func_type != F_COUNT) {
+          return INVALID_SELECT_DEFINITION; // Only COUNT(*) is valid
         }
+        strcpy(param_name, "*");
+        cur = cur->next;
+      } else if (cur->tok_class == keyword || cur->tok_class == identifier ||
+                 cur->tok_class == type_name) {
+        strcpy(param_name, cur->tok_string);
+        cur = cur->next;
       } else {
         return INVALID_SELECT_DEFINITION;
       }
+      
+      // Expect closing parenthesis
+      if (cur->tok_value != S_RIGHT_PAREN) {
+        return INVALID_SELECT_DEFINITION;
+      }
+      cur = cur->next;
+      
+      // Store aggregate function
+      agg_funcs[num_agg_funcs].type = func_type;
+      strcpy(agg_funcs[num_agg_funcs].col_name, param_name);
+      num_agg_funcs++;
+      
+      // Check for comma indicating more aggregates
+      if (cur->tok_value == S_COMMA) {
+        cur = cur->next;
+      } else {
+        break;
+      }
+    } while (cur->tok_class == function_name);
+    
+    // If we saw a comma but no function follows, it's an error
+    if (cur->tok_value == S_COMMA || 
+        (num_agg_funcs > 0 && cur[-1].tok_value == S_COMMA)) {
+      return INVALID_SELECT_DEFINITION;
     }
+  } else {
+    // Parse list of column names
+    do {
+      if (cur->tok_class != keyword && cur->tok_class != identifier &&
+          cur->tok_class != type_name) {
+        return INVALID_SELECT_DEFINITION;
+      }
+      strcpy(sel_cols[num_sel_cols].name, cur->tok_string);
+      num_sel_cols++;
+      cur = cur->next;
+      
+      if (cur->tok_value == S_COMMA) {
+        cur = cur->next;
+      } else {
+        break;
+      }
+    } while (true);
   }
 
   // 2. Parse FROM
@@ -1888,6 +1933,32 @@ int sem_select(token_list *t_list) {
   tpd_entry *tpd1 = get_tpd_from_list(table1);
   if (!tpd1) {
     return TABLE_NOT_EXIST;
+  }
+
+  // Validate aggregate functions on appropriate column types
+  if (is_aggregate) {
+    cd_entry *cols = (cd_entry *)((char *)tpd1 + tpd1->cd_offset);
+    for (int i = 0; i < num_agg_funcs; i++) {
+      if (agg_funcs[i].type == F_SUM || agg_funcs[i].type == F_AVG) {
+        if (strcmp(agg_funcs[i].col_name, "*") != 0) {
+          // Find the column and check if it's INT type
+          bool found = false;
+          for (int k = 0; k < tpd1->num_columns; k++) {
+            if (strcasecmp(cols[k].col_name, agg_funcs[i].col_name) == 0) {
+              found = true;
+              if (cols[k].col_type != T_INT) {
+                printf("Error: SUM and AVG can only be used on integer columns\n");
+                return INVALID_SELECT_DEFINITION;
+              }
+              break;
+            }
+          }
+          if (!found) {
+            return COLUMN_NOT_EXIST;
+          }
+        }
+      }
+    }
   }
 
   // 3. Parse NATURAL JOIN (Optional)
@@ -1914,38 +1985,32 @@ int sem_select(token_list *t_list) {
     cur = cur->next;
   }
 
-  // 4. Parse WHERE (Optional)
-  struct Condition {
-    char col_name[MAX_IDENT_LEN + 1];
-    int op;       // S_EQUAL, S_LESS, S_GREATER, K_IS
-    int val_type; // INT_LITERAL, STRING_LITERAL, K_NULL, K_NOT (for IS NOT
-                  // NULL)
-    int int_val;
-    char str_val[256];
-    int logical_op; // K_AND, K_OR, 0 for last
-  } conditions[10]; // Support up to 10 conditions
+  // 4. Parse WHERE clause (optional)
+  query_condition conditions[10];  // Support up to 10 conditions
   int num_conditions = 0;
 
   if (cur->tok_value == K_WHERE) {
     cur = cur->next;
-    while (true) {
-      if ((cur->tok_class != keyword) && (cur->tok_class != identifier) &&
-          (cur->tok_class != type_name)) {
+    do {
+      // Parse column name
+      if (cur->tok_class != keyword && cur->tok_class != identifier &&
+          cur->tok_class != type_name) {
         return COLUMN_NOT_EXIST;
       }
       strcpy(conditions[num_conditions].col_name, cur->tok_string);
       cur = cur->next;
 
+      // Parse operator and value
       if (cur->tok_value == K_IS) {
-        conditions[num_conditions].op = K_IS;
+        conditions[num_conditions].operator_type = K_IS;
         cur = cur->next;
         if (cur->tok_value == K_NULL) {
-          conditions[num_conditions].val_type = K_NULL;
+          conditions[num_conditions].value_type = K_NULL;
           cur = cur->next;
         } else if (cur->tok_value == K_NOT) {
           cur = cur->next;
           if (cur->tok_value == K_NULL) {
-            conditions[num_conditions].val_type = K_NOT; // IS NOT NULL
+            conditions[num_conditions].value_type = K_NOT;  // IS NOT NULL
             cur = cur->next;
           } else {
             return INVALID_STATEMENT;
@@ -1955,33 +2020,66 @@ int sem_select(token_list *t_list) {
         }
       } else if (cur->tok_value == S_EQUAL || cur->tok_value == S_LESS ||
                  cur->tok_value == S_GREATER) {
-        conditions[num_conditions].op = cur->tok_value;
+        conditions[num_conditions].operator_type = cur->tok_value;
         cur = cur->next;
+        
+        // Parse value
         if (cur->tok_value == INT_LITERAL) {
-          conditions[num_conditions].val_type = INT_LITERAL;
-          conditions[num_conditions].int_val = atoi(cur->tok_string);
+          conditions[num_conditions].value_type = INT_LITERAL;
+          conditions[num_conditions].int_value = atoi(cur->tok_string);
           cur = cur->next;
         } else if (cur->tok_value == STRING_LITERAL) {
-          conditions[num_conditions].val_type = STRING_LITERAL;
-          strcpy(conditions[num_conditions].str_val, cur->tok_string);
+          conditions[num_conditions].value_type = STRING_LITERAL;
+          strcpy(conditions[num_conditions].str_value, cur->tok_string);
           cur = cur->next;
         } else {
           return INVALID_STATEMENT;
         }
+        
+        // Validate type compatibility between column and value
+        // For JOIN scenarios, we'll defer validation since column might be in table2
+        // For now, check if column exists in table1
+        cd_entry *cols_check = (cd_entry *)((char *)tpd1 + tpd1->cd_offset);
+        int col_idx = -1;
+        for (int k = 0; k < tpd1->num_columns; k++) {
+          if (strcasecmp(cols_check[k].col_name, conditions[num_conditions].col_name) == 0) {
+            col_idx = k;
+            break;
+          }
+        }
+        
+        // If column found in table1, validate type compatibility
+        if (col_idx != -1) {
+          // Type mismatch validation
+          if (cols_check[col_idx].col_type == T_INT && 
+              conditions[num_conditions].value_type == STRING_LITERAL) {
+            printf("Error: Type mismatch - cannot compare integer column with string value\n");
+            return TYPE_MISMATCH;
+          }
+          if (cols_check[col_idx].col_type != T_INT && 
+              conditions[num_conditions].value_type == INT_LITERAL) {
+            printf("Error: Type mismatch - cannot compare string column with integer value\n");
+            return TYPE_MISMATCH;
+          }
+        }
+        // If column not in table1 and there's no JOIN yet parsed, it's an error
+        // But since we haven't parsed JOIN yet at this point, we'll defer this check
+        // The column existence will be validated during execution
       } else {
         return INVALID_STATEMENT;
       }
 
+      // Check for logical operators (AND/OR)
       if (cur->tok_value == K_AND || cur->tok_value == K_OR) {
-        conditions[num_conditions].logical_op = cur->tok_value;
+        conditions[num_conditions].logical_operator = cur->tok_value;
         num_conditions++;
         cur = cur->next;
       } else {
-        conditions[num_conditions].logical_op = 0;
+        conditions[num_conditions].logical_operator = 0;  // Last condition
         num_conditions++;
         break;
       }
-    }
+    } while (true);
   }
 
   // 5. Parse ORDER BY (Optional)
@@ -2115,7 +2213,7 @@ int sem_select(token_list *t_list) {
         // Helper to eval one condition
         auto eval = [&](int cond_idx, unsigned char *row,
                         tpd_entry *tpd) -> bool {
-          Condition *c = &conditions[cond_idx];
+          query_condition *c = &conditions[cond_idx];
           // Find column
           int col_idx = -1;
           cd_entry *cols = (cd_entry *)((char *)tpd + tpd->cd_offset);
@@ -2138,10 +2236,10 @@ int sem_select(token_list *t_list) {
 
           unsigned char len = row[offset++];
 
-          if (c->op == K_IS) {
-            if (c->val_type == K_NULL)
+          if (c->operator_type == K_IS) {
+            if (c->value_type == K_NULL)
               return (len == 0);
-            if (c->val_type == K_NOT)
+            if (c->value_type == K_NOT)
               return (len != 0);
           }
 
@@ -2151,21 +2249,21 @@ int sem_select(token_list *t_list) {
           if (cols[col_idx].col_type == T_INT) {
             int val;
             memcpy(&val, row + offset, 4);
-            if (c->op == S_EQUAL)
-              return val == c->int_val;
-            if (c->op == S_LESS)
-              return val < c->int_val;
-            if (c->op == S_GREATER)
-              return val > c->int_val;
+            if (c->operator_type == S_EQUAL)
+              return val == c->int_value;
+            if (c->operator_type == S_LESS)
+              return val < c->int_value;
+            if (c->operator_type == S_GREATER)
+              return val > c->int_value;
           } else {
             char val_str[256] = {0};
             memcpy(val_str, row + offset, len);
-            int cmp = strcmp(val_str, c->str_val);
-            if (c->op == S_EQUAL)
+            int cmp = strcmp(val_str, c->str_value);
+            if (c->operator_type == S_EQUAL)
               return cmp == 0;
-            if (c->op == S_LESS)
+            if (c->operator_type == S_LESS)
               return cmp < 0;
-            if (c->op == S_GREATER)
+            if (c->operator_type == S_GREATER)
               return cmp > 0;
           }
           return false;
@@ -2174,9 +2272,9 @@ int sem_select(token_list *t_list) {
         current_res = eval(0, buf1, tpd1);
         for (int k = 0; k < num_conditions - 1; k++) {
           bool next_res = eval(k + 1, buf1, tpd1);
-          if (conditions[k].logical_op == K_AND)
+          if (conditions[k].logical_operator == K_AND)
             current_res = current_res && next_res;
-          else if (conditions[k].logical_op == K_OR)
+          else if (conditions[k].logical_operator == K_OR)
             current_res = current_res || next_res;
         }
         match = current_res;
@@ -2205,7 +2303,7 @@ int sem_select(token_list *t_list) {
           if (num_conditions > 0) {
             bool current_res = false;
             auto eval_join = [&](int cond_idx) -> bool {
-              Condition *c = &conditions[cond_idx];
+              query_condition *c = &conditions[cond_idx];
               // Try tpd1
               int col_idx = -1;
               bool in_t1 = true;
@@ -2239,10 +2337,10 @@ int sem_select(token_list *t_list) {
               }
               unsigned char len = row[offset++];
 
-              if (c->op == K_IS) {
-                if (c->val_type == K_NULL)
+              if (c->operator_type == K_IS) {
+                if (c->value_type == K_NULL)
                   return (len == 0);
-                if (c->val_type == K_NOT)
+                if (c->value_type == K_NOT)
                   return (len != 0);
               }
               if (len == 0)
@@ -2251,21 +2349,21 @@ int sem_select(token_list *t_list) {
               if (cols[col_idx].col_type == T_INT) {
                 int val;
                 memcpy(&val, row + offset, 4);
-                if (c->op == S_EQUAL)
-                  return val == c->int_val;
-                if (c->op == S_LESS)
-                  return val < c->int_val;
-                if (c->op == S_GREATER)
-                  return val > c->int_val;
+                if (c->operator_type == S_EQUAL)
+                  return val == c->int_value;
+                if (c->operator_type == S_LESS)
+                  return val < c->int_value;
+                if (c->operator_type == S_GREATER)
+                  return val > c->int_value;
               } else {
                 char val_str[256] = {0};
                 memcpy(val_str, row + offset, len);
-                int cmp = strcmp(val_str, c->str_val);
-                if (c->op == S_EQUAL)
+                int cmp = strcmp(val_str, c->str_value);
+                if (c->operator_type == S_EQUAL)
                   return cmp == 0;
-                if (c->op == S_LESS)
+                if (c->operator_type == S_LESS)
                   return cmp < 0;
-                if (c->op == S_GREATER)
+                if (c->operator_type == S_GREATER)
                   return cmp > 0;
               }
               return false;
@@ -2274,9 +2372,9 @@ int sem_select(token_list *t_list) {
             current_res = eval_join(0);
             for (int k = 0; k < num_conditions - 1; k++) {
               bool next_res = eval_join(k + 1);
-              if (conditions[k].logical_op == K_AND)
+              if (conditions[k].logical_operator == K_AND)
                 current_res = current_res && next_res;
-              else if (conditions[k].logical_op == K_OR)
+              else if (conditions[k].logical_operator == K_OR)
                 current_res = current_res || next_res;
             }
             match = current_res;
@@ -2392,97 +2490,127 @@ int sem_select(token_list *t_list) {
     }
   }
 
-  // Aggregate or Print
+  // Output results: either aggregate or row-by-row
   if (is_aggregate) {
-    long long sum = 0;
-    int count = 0;
-
-    // Find agg col index
-    int agg_col_idx = -1;
-    bool in_t1 = true;
-    if (agg_type != F_COUNT || strcmp(agg_col, "*") != 0) {
+    // Structure to hold aggregate computation results
+    struct AggregateResult {
+      long long sum_value;
+      int row_count;
+      int column_index;
+      bool is_in_table1;
+    };
+    AggregateResult agg_results[MAX_NUM_COL];
+    
+    // Initialize aggregate results and locate columns
+    for (int a = 0; a < num_agg_funcs; a++) {
+      agg_results[a].sum_value = 0;
+      agg_results[a].row_count = 0;
+      agg_results[a].column_index = -1;
+      agg_results[a].is_in_table1 = true;
+      
+      // For COUNT(*), no column lookup needed
+      if (agg_funcs[a].type == F_COUNT && strcmp(agg_funcs[a].col_name, "*") == 0) {
+        continue;
+      }
+      
+      // Locate column in table1
       for (int k = 0; k < tpd1->num_columns; k++) {
-        if (strcasecmp(cols1[k].col_name, agg_col) == 0) {
-          agg_col_idx = k;
+        if (strcasecmp(cols1[k].col_name, agg_funcs[a].col_name) == 0) {
+          agg_results[a].column_index = k;
           break;
         }
       }
-      if (has_join && agg_col_idx == -1) {
-        in_t1 = false;
+      
+      // If not found and we have a join, look in table2
+      if (has_join && agg_results[a].column_index == -1) {
+        agg_results[a].is_in_table1 = false;
         for (int k = 0; k < tpd2->num_columns; k++) {
-          if (strcasecmp(cols2[k].col_name, agg_col) == 0) {
-            agg_col_idx = k;
+          if (strcasecmp(cols2[k].col_name, agg_funcs[a].col_name) == 0) {
+            agg_results[a].column_index = k;
             break;
           }
         }
       }
-      if (agg_col_idx == -1 && agg_type != F_COUNT) {
-        // Error if not count(*)
-        // actually count(col) is valid too
+      
+      // Column not found (error unless it's COUNT which can be flexible)
+      if (agg_results[a].column_index == -1 && agg_funcs[a].type != F_COUNT) {
         return INVALID_COLUMN_NAME;
       }
     }
 
+    // Compute aggregates by processing each result row
     for (int i = 0; i < result_count; i++) {
-      if (agg_type == F_COUNT && strcmp(agg_col, "*") == 0) {
-        count++;
-      } else {
-        unsigned char *row = results[i].data;
-        if (!in_t1)
-          row += h1.record_size;
-        cd_entry *cols = in_t1 ? cols1 : cols2;
-
-        int off = 0;
-        for (int k = 0; k < agg_col_idx; k++) {
-          if (cols[k].col_type == T_INT)
-            off += 5;
-          else
-            off += 1 + cols[k].col_len;
+      for (int a = 0; a < num_agg_funcs; a++) {
+        // COUNT(*) just counts rows
+        if (agg_funcs[a].type == F_COUNT && strcmp(agg_funcs[a].col_name, "*") == 0) {
+          agg_results[a].row_count++;
+          continue;
         }
-        unsigned char len = row[off++];
+        
+        // Locate data in the appropriate table
+        unsigned char *row_data = results[i].data;
+        if (!agg_results[a].is_in_table1) {
+          row_data += h1.record_size;  // Skip to table2 data
+        }
+        cd_entry *cols = agg_results[a].is_in_table1 ? cols1 : cols2;
 
-        if (len > 0) {
-          if (agg_type == F_COUNT) {
-            count++;
-          } else {
-            if (cols[agg_col_idx].col_type != T_INT) {
-              // SUM/AVG only on INT
-              // But we should check this before loop?
-              // The prompt says "SUM & AVG are only valid on integer column"
-              // We can check type once.
-            }
-            int val;
-            memcpy(&val, row + off, 4);
-            sum += val;
-            count++; // For AVG
+        // Calculate offset to the target column
+        int offset = 0;
+        for (int k = 0; k < agg_results[a].column_index; k++) {
+          if (cols[k].col_type == T_INT)
+            offset += 5;
+          else
+            offset += 1 + cols[k].col_len;
+        }
+        unsigned char field_length = row_data[offset++];
+
+        // Process non-NULL values
+        if (field_length > 0) {
+          if (agg_funcs[a].type == F_COUNT) {
+            agg_results[a].row_count++;
+          } else {  // SUM or AVG
+            int value;
+            memcpy(&value, row_data + offset, 4);
+            agg_results[a].sum_value += value;
+            agg_results[a].row_count++;
           }
         }
       }
     }
 
-    if (agg_type == F_SUM) {
-      printf("SUM(%s)\n", agg_col);
-      printf("----------\n");
-      printf("%lld\n", sum);
-    } else if (agg_type == F_AVG) {
-      printf("AVG(%s)\n", agg_col);
-      printf("----------\n");
-      if (count > 0)
-        printf("%lld\n", sum / count);
-      else
-        printf("0\n");
-    } else if (agg_type == F_COUNT) {
-      printf("COUNT(%s)\n", agg_col);
-      printf("----------\n");
-      // result_count is the filtered count
-      // Wait, count(col) should only count non-nulls.
-      // My loop above handles non-null check for count(col).
-      // For count(*), it's just result_count.
-      if (strcmp(agg_col, "*") == 0)
-        printf("%d\n", result_count);
-      else
-        printf("%d\n", count);
+    // Display aggregate results with proper formatting
+    // Header row (left-justified, 10 chars per column)
+    for (int a = 0; a < num_agg_funcs; a++) {
+      const char *header = (agg_funcs[a].type == F_SUM) ? "SUM" :
+                          (agg_funcs[a].type == F_AVG) ? "AVG" : "COUNT";
+      printf("%-10s", header);
+      if (a < num_agg_funcs - 1) printf(" ");
     }
+    printf("\n");
+    
+    // Separator row
+    for (int a = 0; a < num_agg_funcs; a++) {
+      printf("----------");
+      if (a < num_agg_funcs - 1) printf(" ");
+    }
+    printf("\n");
+    
+    // Value row (right-justified, 10 chars per column)
+    for (int a = 0; a < num_agg_funcs; a++) {
+      if (agg_funcs[a].type == F_SUM) {
+        printf("%10lld", agg_results[a].sum_value);
+      } else if (agg_funcs[a].type == F_AVG) {
+        long long avg = (agg_results[a].row_count > 0) ? 
+                        (agg_results[a].sum_value / agg_results[a].row_count) : 0;
+        printf("%10lld", avg);
+      } else {  // F_COUNT
+        int count = (strcmp(agg_funcs[a].col_name, "*") == 0) ? 
+                    result_count : agg_results[a].row_count;
+        printf("%10d", count);
+      }
+      if (a < num_agg_funcs - 1) printf(" ");
+    }
+    printf("\n");
 
   } else {
     // Print Rows
@@ -2518,7 +2646,7 @@ int sem_select(token_list *t_list) {
         out_cols[num_out].type = cols1[k].col_type;
         out_cols[num_out].len = cols1[k].col_len;
         out_cols[num_out].in_t1 = true;
-        // Calc offset
+        // Calculate byte offset
         int off = 0;
         for (int m = 0; m < k; m++)
           off += (cols1[m].col_type == T_INT ? 5 : 1 + cols1[m].col_len);
@@ -2543,7 +2671,7 @@ int sem_select(token_list *t_list) {
         int idx = -1;
         bool in_t1 = true;
         for (int k = 0; k < tpd1->num_columns; k++) {
-          if (strcasecmp(cols1[k].col_name, sel_cols[i]) == 0) {
+          if (strcasecmp(cols1[k].col_name, sel_cols[i].name) == 0) {
             idx = k;
             break;
           }
@@ -2551,7 +2679,7 @@ int sem_select(token_list *t_list) {
         if (has_join && idx == -1) {
           in_t1 = false;
           for (int k = 0; k < tpd2->num_columns; k++) {
-            if (strcasecmp(cols2[k].col_name, sel_cols[i]) == 0) {
+            if (strcasecmp(cols2[k].col_name, sel_cols[i].name) == 0) {
               idx = k;
               break;
             }
