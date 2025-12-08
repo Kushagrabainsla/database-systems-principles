@@ -140,6 +140,9 @@ typedef enum t_value {
   S_EQUAL,           // 74
   S_LESS,            // 75
   S_GREATER,         // 76
+  S_LESS_EQUAL,      // 77
+  S_GREATER_EQUAL,   // 78
+  S_NOT_EQUAL,       // 79
   IDENT = 85,        // 85
   INT_LITERAL = 90,  // 90
   STRING_LITERAL,    // 91

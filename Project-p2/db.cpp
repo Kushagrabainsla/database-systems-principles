@@ -22,83 +22,83 @@ static int join_out_widths[MAX_NUM_COL * 2];
 static int join_out_types[MAX_NUM_COL * 2];
 static char join_out_names[MAX_NUM_COL * 2][MAX_IDENT_LEN + 8];
 
-static int open_tab_rw(const char *table_name, FILE **pf,
-                       table_file_header *hdr) {
-  char fname[MAX_IDENT_LEN + 5] = {0};
-  snprintf(fname, sizeof(fname), "%s.tab", table_name);
+static int open_tab_rw(const char *table_name, FILE **file_ptr,
+                       table_file_header *header) {
+  char filename[MAX_IDENT_LEN + 5] = {0};
+  snprintf(filename, sizeof(filename), "%s.tab", table_name);
 
-  *pf = fopen(fname, "rb+"); // read/write binary
-  if (!*pf)
+  *file_ptr = fopen(filename, "rb+"); // read/write binary
+  if (!*file_ptr)
     return FILE_OPEN_ERROR;
 
-  fseek(*pf, 0, SEEK_SET);
-  if (fread(hdr, sizeof(*hdr), 1, *pf) != 1) {
-    fclose(*pf);
-    *pf = NULL;
+  fseek(*file_ptr, 0, SEEK_SET);
+  if (fread(header, sizeof(*header), 1, *file_ptr) != 1) {
+    fclose(*file_ptr);
+    *file_ptr = NULL;
     return FILE_OPEN_ERROR;
   }
   return 0;
 }
 
-static int write_header(FILE *f, const table_file_header *hdr_in) {
-  table_file_header on_disk = *hdr_in;
-  on_disk.tpd_ptr = 0; // zero when writing
+static int write_header(FILE *file_ptr, const table_file_header *header_in) {
+  table_file_header on_disk_header = *header_in;
+  on_disk_header.tpd_ptr = 0; // zero when writing
 
   /* Recompute on-disk file_size to reflect actual number of records */
-  on_disk.file_size =
-      on_disk.record_offset + on_disk.record_size * on_disk.num_records;
+  on_disk_header.file_size =
+      on_disk_header.record_offset + on_disk_header.record_size * on_disk_header.num_records;
 
-  fseek(f, 0, SEEK_SET);
-  if (fwrite(&on_disk, sizeof(on_disk), 1, f) != 1)
+  fseek(file_ptr, 0, SEEK_SET);
+  if (fwrite(&on_disk_header, sizeof(on_disk_header), 1, file_ptr) != 1)
     return FILE_WRITE_ERROR;
-  fflush(f);
+  fflush(file_ptr);
   return 0;
 }
 
-static long row_pos(const table_file_header *hdr, int row_idx) {
-  return (long)hdr->record_offset + (long)row_idx * (long)hdr->record_size;
+static long row_pos(const table_file_header *header, int row_index) {
+  return (long)header->record_offset + (long)row_index * (long)header->record_size;
 }
 
-static inline int round4(int n) { return (n + 3) & ~3; }
+static inline int round_to_multiple_of_4(int value) { return (value + 3) & ~3; }
 
-static int compute_record_size_from_tpd(const tpd_entry *tpd) {
-  int rec = 0;
-  const cd_entry *col = (const cd_entry *)((const char *)tpd + tpd->cd_offset);
-  for (int i = 0; i < tpd->num_columns; ++i, ++col) {
-    if (col->col_type == T_INT)
-      rec += 1 + 4; // 1-byte length + 4
+static int compute_record_size_from_tpd(const tpd_entry *table_descriptor) {
+  int record_size = 0;
+  const cd_entry *column = (const cd_entry *)((const char *)table_descriptor + table_descriptor->cd_offset);
+  for (int col_index = 0; col_index < table_descriptor->num_columns; ++col_index, ++column) {
+    if (column->col_type == T_INT)
+      record_size += 1 + 4; // 1-byte length + 4
     else
-      rec += 1 + col->col_len; // CHAR/VARCHAR(n)
+      record_size += 1 + column->col_len; // CHAR/VARCHAR(n)
   }
-  return round4(rec);
+  return round_to_multiple_of_4(record_size);
 }
 
-static int create_table_data_file(const tpd_entry *tpd) {
-  char fname[MAX_IDENT_LEN + 5] = {0};
-  snprintf(fname, sizeof(fname), "%s.tab", tpd->table_name);
+static int create_table_data_file(const tpd_entry *table_descriptor) {
+  char filename[MAX_IDENT_LEN + 5] = {0};
+  snprintf(filename, sizeof(filename), "%s.tab", table_descriptor->table_name);
 
-  int rec_size = compute_record_size_from_tpd(tpd);
+  int record_size = compute_record_size_from_tpd(table_descriptor);
 
-  table_file_header hdr = {0};
-  hdr.record_size = rec_size;
-  hdr.num_records = 0;
-  hdr.record_offset = sizeof(table_file_header);
+  table_file_header header = {0};
+  header.record_size = record_size;
+  header.num_records = 0;
+  header.record_offset = sizeof(table_file_header);
   /* Initially only write the header; do not pre-allocate space for MAX_ROWS */
-  hdr.file_size = hdr.record_offset;
-  hdr.file_header_flag = 0;
-  hdr.tpd_ptr = 0; // zero on disk
+  header.file_size = header.record_offset;
+  header.file_header_flag = 0;
+  header.tpd_ptr = 0; // zero on disk
 
   /* Write only the header to create a small initial file. File will grow as
    * records are inserted. */
-  FILE *fh = fopen(fname, "wb");
-  if (!fh)
+  FILE *file_handle = fopen(filename, "wb");
+  if (!file_handle)
     return FILE_OPEN_ERROR;
-  if (fwrite(&hdr, sizeof(hdr), 1, fh) != 1) {
-    fclose(fh);
+  if (fwrite(&header, sizeof(header), 1, file_handle) != 1) {
+    fclose(file_handle);
     return FILE_WRITE_ERROR;
   }
-  fflush(fh);
-  fclose(fh);
+  fflush(file_handle);
+  fclose(file_handle);
   return 0;
 }
 
@@ -580,33 +580,50 @@ int get_token(char *command, token_list **tok_list) {
     } else if ((*cur == '(') || (*cur == ')') || (*cur == ',') ||
                (*cur == '*') || (*cur == '=') || (*cur == '<') ||
                (*cur == '>')) {
-      /* Catch all the symbols here. Note: no look ahead here. */
+      /* Catch all the symbols here. Check for multi-char operators. */
       int t_value;
-      switch (*cur) {
-      case '(':
-        t_value = S_LEFT_PAREN;
-        break;
-      case ')':
-        t_value = S_RIGHT_PAREN;
-        break;
-      case ',':
-        t_value = S_COMMA;
-        break;
-      case '*':
-        t_value = S_STAR;
-        break;
-      case '=':
-        t_value = S_EQUAL;
-        break;
-      case '<':
-        t_value = S_LESS;
-        break;
-      case '>':
-        t_value = S_GREATER;
-        break;
+      
+      // Check for multi-character operators: <=, >=, <>
+      if (*cur == '<') {
+        temp_string[i++] = *cur++;
+        if (*cur == '=') {
+          temp_string[i++] = *cur++;
+          t_value = S_LESS_EQUAL;
+        } else if (*cur == '>') {
+          temp_string[i++] = *cur++;
+          t_value = S_NOT_EQUAL;
+        } else {
+          t_value = S_LESS;
+        }
+      } else if (*cur == '>') {
+        temp_string[i++] = *cur++;
+        if (*cur == '=') {
+          temp_string[i++] = *cur++;
+          t_value = S_GREATER_EQUAL;
+        } else {
+          t_value = S_GREATER;
+        }
+      } else {
+        // Single character operators
+        switch (*cur) {
+        case '(':
+          t_value = S_LEFT_PAREN;
+          break;
+        case ')':
+          t_value = S_RIGHT_PAREN;
+          break;
+        case ',':
+          t_value = S_COMMA;
+          break;
+        case '*':
+          t_value = S_STAR;
+          break;
+        case '=':
+          t_value = S_EQUAL;
+          break;
+        }
+        temp_string[i++] = *cur++;
       }
-
-      temp_string[i++] = *cur++;
 
       add_to_list(tok_list, temp_string, symbol, t_value);
 
@@ -655,108 +672,108 @@ int get_token(char *command, token_list **tok_list) {
   return rc;
 }
 
-void add_to_list(token_list **tok_list, char *tmp, int t_class, int t_value) {
-  token_list *cur = *tok_list;
-  token_list *ptr = NULL;
+void add_to_list(token_list **tok_list, char *token_string, int token_class, int token_value) {
+  token_list *current = *tok_list;
+  token_list *new_token = NULL;
 
-  // printf("%16s \t%d \t %d\n",tmp, t_class, t_value);
+  // printf("%16s \t%d \t %d\n",token_string, token_class, token_value);
 
-  ptr = (token_list *)calloc(1, sizeof(token_list));
-  strcpy(ptr->tok_string, tmp);
-  ptr->tok_class = t_class;
-  ptr->tok_value = t_value;
-  ptr->next = NULL;
+  new_token = (token_list *)calloc(1, sizeof(token_list));
+  strcpy(new_token->tok_string, token_string);
+  new_token->tok_class = token_class;
+  new_token->tok_value = token_value;
+  new_token->next = NULL;
 
-  if (cur == NULL)
-    *tok_list = ptr;
+  if (current == NULL)
+    *tok_list = new_token;
   else {
-    while (cur->next != NULL)
-      cur = cur->next;
+    while (current->next != NULL)
+      current = current->next;
 
-    cur->next = ptr;
+    current->next = new_token;
   }
   return;
 }
 
 int do_semantic(token_list *tok_list) {
-  int rc = 0, cur_cmd = INVALID_STATEMENT;
+  int return_code = 0, current_command = INVALID_STATEMENT;
   bool unique = false;
-  token_list *cur = tok_list;
+  token_list *current_token = tok_list;
 
-  if ((cur->tok_value == K_CREATE) &&
-      ((cur->next != NULL) && (cur->next->tok_value == K_TABLE))) {
+  if ((current_token->tok_value == K_CREATE) &&
+      ((current_token->next != NULL) && (current_token->next->tok_value == K_TABLE))) {
     printf("CREATE TABLE statement\n");
-    cur_cmd = CREATE_TABLE;
-    cur = cur->next->next;
-  } else if ((cur->tok_value == K_DROP) &&
-             ((cur->next != NULL) && (cur->next->tok_value == K_TABLE))) {
+    current_command = CREATE_TABLE;
+    current_token = current_token->next->next;
+  } else if ((current_token->tok_value == K_DROP) &&
+             ((current_token->next != NULL) && (current_token->next->tok_value == K_TABLE))) {
     printf("DROP TABLE statement\n");
-    cur_cmd = DROP_TABLE;
-    cur = cur->next->next;
-  } else if ((cur->tok_value == K_LIST) &&
-             ((cur->next != NULL) && (cur->next->tok_value == K_TABLE))) {
+    current_command = DROP_TABLE;
+    current_token = current_token->next->next;
+  } else if ((current_token->tok_value == K_LIST) &&
+             ((current_token->next != NULL) && (current_token->next->tok_value == K_TABLE))) {
     printf("LIST TABLE statement\n");
-    cur_cmd = LIST_TABLE;
-    cur = cur->next->next;
-  } else if ((cur->tok_value == K_LIST) &&
-             ((cur->next != NULL) && (cur->next->tok_value == K_SCHEMA))) {
+    current_command = LIST_TABLE;
+    current_token = current_token->next->next;
+  } else if ((current_token->tok_value == K_LIST) &&
+             ((current_token->next != NULL) && (current_token->next->tok_value == K_SCHEMA))) {
     printf("LIST SCHEMA statement\n");
-    cur_cmd = LIST_SCHEMA;
-    cur = cur->next->next;
-  } else if ((cur->tok_value == K_INSERT) && (cur->next != NULL) &&
-             (cur->next->tok_value == K_INTO)) {
+    current_command = LIST_SCHEMA;
+    current_token = current_token->next->next;
+  } else if ((current_token->tok_value == K_INSERT) && (current_token->next != NULL) &&
+             (current_token->next->tok_value == K_INTO)) {
     printf("INSERT statement\n");
-    cur_cmd = INSERT;      // uses your enum (104)
-    cur = cur->next->next; // point at <table_name>
-  } else if ((cur->tok_value == K_DELETE) && (cur->next != NULL) &&
-             (cur->next->tok_value == K_FROM)) {
+    current_command = INSERT;      // uses your enum (104)
+    current_token = current_token->next->next; // point at <table_name>
+  } else if ((current_token->tok_value == K_DELETE) && (current_token->next != NULL) &&
+             (current_token->next->tok_value == K_FROM)) {
     printf("DELETE statement\n");
-    cur_cmd = DELETE;
-    cur = cur->next->next;
-  } else if ((cur->tok_value == K_UPDATE) && (cur->next != NULL)) {
+    current_command = DELETE;
+    current_token = current_token->next->next;
+  } else if ((current_token->tok_value == K_UPDATE) && (current_token->next != NULL)) {
     printf("UPDATE statement\n");
-    cur_cmd = UPDATE;
-    cur = cur->next;
-  } else if (cur->tok_value == K_SELECT) {
+    current_command = UPDATE;
+    current_token = current_token->next;
+  } else if (current_token->tok_value == K_SELECT) {
     printf("SELECT statement\n");
-    cur_cmd = SELECT;
-    cur = cur->next;
+    current_command = SELECT;
+    current_token = current_token->next;
   } else {
     printf("Invalid statement\n");
-    rc = cur_cmd;
+    return_code = current_command;
   }
 
-  if (cur_cmd != INVALID_STATEMENT) {
-    switch (cur_cmd) {
+  if (current_command != INVALID_STATEMENT) {
+    switch (current_command) {
     case CREATE_TABLE:
-      rc = sem_create_table(cur);
+      return_code = sem_create_table(current_token);
       break;
     case DROP_TABLE:
-      rc = sem_drop_table(cur);
+      return_code = sem_drop_table(current_token);
       break;
     case LIST_TABLE:
-      rc = sem_list_tables();
+      return_code = sem_list_tables();
       break;
     case LIST_SCHEMA:
-      rc = sem_list_schema(cur);
+      return_code = sem_list_schema(current_token);
       break;
     case INSERT:
-      rc = sem_insert_into(cur);
+      return_code = sem_insert_into(current_token);
       break;
     case DELETE:
-      rc = sem_delete(cur);
+      return_code = sem_delete(current_token);
       break;
     case UPDATE:
-      rc = sem_update(cur);
+      return_code = sem_update(current_token);
       break;
     case SELECT:
-      rc = sem_select(cur);
+      return_code = sem_select(current_token);
       break;
     default:; /* no action */
     }
   }
 
-  return rc;
+  return return_code;
 }
 
 int sem_create_table(token_list *t_list) {
@@ -1359,7 +1376,8 @@ int sem_delete(token_list *t_list) {
     cur = cur->next;
 
     if (cur->tok_value != S_EQUAL && cur->tok_value != S_LESS &&
-        cur->tok_value != S_GREATER) {
+        cur->tok_value != S_GREATER && cur->tok_value != S_LESS_EQUAL &&
+        cur->tok_value != S_GREATER_EQUAL && cur->tok_value != S_NOT_EQUAL) {
       rc = INVALID_STATEMENT;
       cur->tok_value = INVALID;
       return rc;
@@ -1450,6 +1468,12 @@ int sem_delete(token_list *t_list) {
                 match = (row_int < where_value_int);
               else if (where_operator == S_GREATER)
                 match = (row_int > where_value_int);
+              else if (where_operator == S_LESS_EQUAL)
+                match = (row_int <= where_value_int);
+              else if (where_operator == S_GREATER_EQUAL)
+                match = (row_int >= where_value_int);
+              else if (where_operator == S_NOT_EQUAL)
+                match = (row_int != where_value_int);
             }
             offset += 4;
           } else {
@@ -1462,6 +1486,12 @@ int sem_delete(token_list *t_list) {
                 match = (cmp < 0);
               else if (where_operator == S_GREATER)
                 match = (cmp > 0);
+              else if (where_operator == S_LESS_EQUAL)
+                match = (cmp <= 0);
+              else if (where_operator == S_GREATER_EQUAL)
+                match = (cmp >= 0);
+              else if (where_operator == S_NOT_EQUAL)
+                match = !(cmp == 0 && len == strlen(where_value_str));
             }
             offset += columns[col].col_len;
           }
@@ -1662,7 +1692,8 @@ int sem_update(token_list *t_list) {
 
     cur = cur->next;
     if (cur->tok_value != S_EQUAL && cur->tok_value != S_LESS &&
-        cur->tok_value != S_GREATER) {
+        cur->tok_value != S_GREATER && cur->tok_value != S_LESS_EQUAL &&
+        cur->tok_value != S_GREATER_EQUAL && cur->tok_value != S_NOT_EQUAL) {
       rc = INVALID_STATEMENT;
       cur->tok_value = INVALID;
       return rc;
@@ -1730,6 +1761,12 @@ int sem_update(token_list *t_list) {
                 match = (row_int < where_value_int);
               else if (where_operator == S_GREATER)
                 match = (row_int > where_value_int);
+              else if (where_operator == S_LESS_EQUAL)
+                match = (row_int <= where_value_int);
+              else if (where_operator == S_GREATER_EQUAL)
+                match = (row_int >= where_value_int);
+              else if (where_operator == S_NOT_EQUAL)
+                match = (row_int != where_value_int);
             }
             offset += 4;
           } else {
@@ -1745,6 +1782,12 @@ int sem_update(token_list *t_list) {
                 match = (cmp < 0);
               else if (where_operator == S_GREATER)
                 match = (cmp > 0);
+              else if (where_operator == S_LESS_EQUAL)
+                match = (cmp <= 0);
+              else if (where_operator == S_GREATER_EQUAL)
+                match = (cmp >= 0);
+              else if (where_operator == S_NOT_EQUAL)
+                match = (cmp != 0);
             }
             offset += columns[col].col_len;
           }
@@ -2019,7 +2062,8 @@ int sem_select(token_list *t_list) {
           return INVALID_STATEMENT;
         }
       } else if (cur->tok_value == S_EQUAL || cur->tok_value == S_LESS ||
-                 cur->tok_value == S_GREATER) {
+                 cur->tok_value == S_GREATER || cur->tok_value == S_LESS_EQUAL ||
+                 cur->tok_value == S_GREATER_EQUAL || cur->tok_value == S_NOT_EQUAL) {
         conditions[num_conditions].operator_type = cur->tok_value;
         cur = cur->next;
         
@@ -2255,6 +2299,12 @@ int sem_select(token_list *t_list) {
               return val < c->int_value;
             if (c->operator_type == S_GREATER)
               return val > c->int_value;
+            if (c->operator_type == S_LESS_EQUAL)
+              return val <= c->int_value;
+            if (c->operator_type == S_GREATER_EQUAL)
+              return val >= c->int_value;
+            if (c->operator_type == S_NOT_EQUAL)
+              return val != c->int_value;
           } else {
             char val_str[256] = {0};
             memcpy(val_str, row + offset, len);
@@ -2265,6 +2315,12 @@ int sem_select(token_list *t_list) {
               return cmp < 0;
             if (c->operator_type == S_GREATER)
               return cmp > 0;
+            if (c->operator_type == S_LESS_EQUAL)
+              return cmp <= 0;
+            if (c->operator_type == S_GREATER_EQUAL)
+              return cmp >= 0;
+            if (c->operator_type == S_NOT_EQUAL)
+              return cmp != 0;
           }
           return false;
         };
